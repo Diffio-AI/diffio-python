@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "diffio"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python SDK for the Diffio API."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -33,6 +33,10 @@ dev = [
     "pytest>=7.4",
     "twine>=5.0",
 ]
+
+[project.urls]
+Homepage = "https://diffio.ai"
+Repository = "https://github.com/Diffio-AI/diffio-python"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
