@@ -660,35 +660,6 @@ def test_list_project_generations_payload_and_response():
     assert response.generations[0].progress is None
 
 
-def test_webhooks_portal_access_payload_and_response():
-    received = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        received["path"] = request.url.path
-        payload = json.loads(request.content.decode("utf-8"))
-        received["payload"] = payload
-        return httpx.Response(
-            200,
-            json={
-                "portalUrl": "https://app.svix.com/app-portal/test",
-                "mode": "test",
-                "apiKeyId": "key_123",
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    response = client.webhooks.get_portal_access(mode="test", apiKeyId="key_123")
-
-    assert received["path"] == "/v1/webhooks/app_portal_access"
-    assert received["payload"]["mode"] == "test"
-    assert received["payload"]["apiKeyId"] == "key_123"
-    assert response.portalUrl == "https://app.svix.com/app-portal/test"
-    assert response.mode == "test"
-
-
 def test_webhooks_send_test_event_payload_and_response():
     received = {}
 
@@ -702,7 +673,7 @@ def test_webhooks_send_test_event_payload_and_response():
                 "svixMessageId": "msg_123",
                 "eventId": "evt_123",
                 "eventType": "generation.completed",
-                "mode": "test",
+                "mode": "live",
                 "apiKeyId": "key_123",
             },
         )
@@ -713,14 +684,14 @@ def test_webhooks_send_test_event_payload_and_response():
 
     response = client.webhooks.send_test_event(
         eventType="generation.completed",
-        mode="test",
+        mode="live",
         apiKeyId="key_123",
         samplePayload={"apiProjectId": "proj_123"},
     )
 
     assert received["path"] == "/v1/webhooks/send_test_event"
     assert received["payload"]["eventType"] == "generation.completed"
-    assert received["payload"]["mode"] == "test"
+    assert received["payload"]["mode"] == "live"
     assert received["payload"]["apiKeyId"] == "key_123"
     assert received["payload"]["samplePayload"]["apiProjectId"] == "proj_123"
     assert response.svixMessageId == "msg_123"

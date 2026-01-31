@@ -11,9 +11,10 @@ on:
 
 jobs:
   publish:
+    if: ${{ github.actor != 'github-actions[bot]' }}
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       id-token: write
     defaults:
       run:
@@ -32,38 +33,126 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install build
 
-      - name: Decide whether to publish
-        id: should_publish
+      - name: Decide version
+        id: version
         run: |
           python - <<'PY'
           import json
           import os
+          import re
           import urllib.request
           import tomllib
           from pathlib import Path
 
           data = tomllib.loads(Path("pyproject.toml").read_text())
           name = data["project"]["name"]
-          version = data["project"]["version"]
+          current = data["project"]["version"]
+
+          def parse(value: str) -> list[int]:
+              core = value.split("-", 1)[0].split("+", 1)[0]
+              parts = [int(part) for part in core.split(".") if part.isdigit()]
+              while len(parts) < 3:
+                  parts.append(0)
+              return parts[:3]
+
+          def compare(left: str, right: str) -> int:
+              a = parse(left)
+              b = parse(right)
+              for i in range(3):
+                  if a[i] > b[i]:
+                      return 1
+                  if a[i] < b[i]:
+                      return -1
+              return 0
+
+          def bump_patch(value: str) -> str:
+              major, minor, patch = parse(value)
+              return f"{major}.{minor}.{patch + 1}"
 
           url = f"https://pypi.org/pypi/{name}/json"
           try:
               with urllib.request.urlopen(url, timeout=10) as resp:
                   payload = json.loads(resp.read().decode("utf-8"))
-              published = version in payload.get("releases", {})
+              published = payload.get("info", {}).get("version")
           except Exception:
-              published = False
+              published = None
+
+          next_version = current
+          bump_needed = False
+          if published:
+              comparison = compare(current, published)
+              if comparison <= 0:
+                  next_version = bump_patch(current if comparison == 0 else published)
+                  bump_needed = True
+
+          publish = (published is None) or (compare(next_version, published) > 0 if published else True)
 
           output = os.environ.get("GITHUB_OUTPUT")
           if output:
               with open(output, "a", encoding="utf-8") as handle:
-                  handle.write(f"publish={'false' if published else 'true'}\n")
+                  handle.write(f"current_version={current}\n")
+                  handle.write(f"published_version={published or ''}\n")
+                  handle.write(f"next_version={next_version}\n")
+                  handle.write(f"bump_needed={'true' if bump_needed else 'false'}\n")
+                  handle.write(f"publish={'true' if publish else 'false'}\n")
           PY
 
+      - name: Sync version files
+        id: sync_version
+        env:
+          NEXT_VERSION: ${{ steps.version.outputs.next_version }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          next_version = os.environ.get("NEXT_VERSION")
+          if not next_version:
+              raise SystemExit(0)
+
+          pyproject_path = Path("pyproject.toml")
+          pyproject_text = pyproject_path.read_text()
+          updated_pyproject = re.sub(
+              r'(?m)^version = "[^"]+"',
+              f'version = "{next_version}"',
+              pyproject_text,
+              count=1,
+          )
+          if updated_pyproject != pyproject_text:
+              pyproject_path.write_text(updated_pyproject)
+
+          init_path = Path("src/diffio/__init__.py")
+          if init_path.exists():
+              init_text = init_path.read_text()
+              updated_init = re.sub(
+                  r'(?m)^__version__ = "[^"]+"',
+                  f'__version__ = "{next_version}"',
+                  init_text,
+                  count=1,
+              )
+              if updated_init != init_text:
+                  init_path.write_text(updated_init)
+          PY
+          if git diff --quiet -- pyproject.toml src/diffio/__init__.py; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit version update
+        if: ${{ steps.sync_version.outputs.changed == 'true' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml src/diffio/__init__.py
+          git commit -m "chore(release): bump Python SDK to ${{ steps.version.outputs.next_version }}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
       - name: Build
-        if: ${{ steps.should_publish.outputs.publish == 'true' }}
+        if: ${{ steps.version.outputs.publish == 'true' }}
         run: python -m build
 
       - name: Publish to PyPI
-        if: ${{ steps.should_publish.outputs.publish == 'true' }}
+        if: ${{ steps.version.outputs.publish == 'true' }}
         uses: pypa/gh-action-pypi-publish@release/v1

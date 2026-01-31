@@ -24,12 +24,6 @@ Set your API key:
 export DIFFIO_API_KEY="diffio_live_..."
 ```
 
-Optional emulator base URL:
-
-```bash
-export DIFFIO_API_BASE_URL="http://127.0.0.1:5001/diffioai/us-central1"
-```
-
 ## Run the tutorial
 
 ```bash

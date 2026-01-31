@@ -7,6 +7,7 @@ import warnings
 from urllib.parse import urlparse
 
 import httpx
+from svix.webhooks import Webhook
 
 from .errors import DiffioApiError
 from .types import (
@@ -16,12 +17,12 @@ from .types import (
     DownloadType,
     GenerationDownloadResponse,
     GenerationProgressResponse,
+    GenerationWebhookEvent,
     ListProjectGenerationsResponse,
     ListProjectsResponse,
     ModelKey,
     WebhookEventType,
     WebhookMode,
-    WebhookPortalResponse,
     WebhookTestEventResponse,
 )
 
@@ -98,6 +99,35 @@ def _merge_request_options(base_options, override_options):
         ),
         apiKey=override.apiKey if override.apiKey is not None else base_options.apiKey,
     )
+
+
+def _normalize_svix_headers(headers):
+    normalized = {}
+    if headers is None:
+        return normalized
+    if not hasattr(headers, "items"):
+        raise ValueError("headers must be a dict-like object")
+    for key, value in headers.items():
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            normalized[str(key).lower()] = ",".join([str(item) for item in value])
+        else:
+            normalized[str(key).lower()] = str(value)
+    return normalized
+
+
+def _extract_svix_headers(headers):
+    normalized = _normalize_svix_headers(headers)
+    required = ["svix-id", "svix-timestamp", "svix-signature"]
+    missing = [header for header in required if not normalized.get(header)]
+    if missing:
+        raise DiffioApiError(f"Missing webhook headers: {', '.join(missing)}")
+    return {
+        "svix-id": normalized["svix-id"],
+        "svix-timestamp": normalized["svix-timestamp"],
+        "svix-signature": normalized["svix-signature"],
+    }
 
 
 def _default_request_options():
@@ -496,42 +526,6 @@ class DiffioClient:
         )
         return GenerationDownloadResponse.from_dict(response)
 
-    def get_webhooks_portal_access(
-        self,
-        *,
-        mode,
-        apiKeyId=None,
-        requestOptions=None,
-    ):
-        """
-        Gets the Svix App Portal URL for configuring webhooks.
-
-        Parameters
-        ----------
-        mode : str
-            Webhook mode, test or live.
-        apiKeyId : str, optional
-            Optional API key id to validate access.
-
-        Returns
-        -------
-        WebhookPortalResponse
-            App portal URL and mode.
-        """
-        if mode not in WebhookMode:
-            raise ValueError("mode must be test or live")
-        payload = {"mode": mode}
-        if apiKeyId is not None:
-            payload["apiKeyId"] = apiKeyId
-
-        response = self._request(
-            "POST",
-            "webhooks/app_portal_access",
-            json_payload=payload,
-            requestOptions=requestOptions,
-        )
-        return WebhookPortalResponse.from_dict(response)
-
     def send_webhook_test_event(
         self,
         *,
@@ -841,19 +835,6 @@ class WebhooksClient:
     def __init__(self, parent):
         self._parent = parent
 
-    def get_portal_access(
-        self,
-        *,
-        mode,
-        apiKeyId=None,
-        requestOptions=None,
-    ):
-        return self._parent.get_webhooks_portal_access(
-            mode=mode,
-            apiKeyId=apiKeyId,
-            requestOptions=requestOptions,
-        )
-
     def send_test_event(
         self,
         *,
@@ -870,6 +851,29 @@ class WebhooksClient:
             samplePayload=samplePayload,
             requestOptions=requestOptions,
         )
+
+    def verify_signature(
+        self,
+        *,
+        payload,
+        headers,
+        secret,
+    ):
+        if not secret:
+            raise DiffioApiError("secret is required")
+        if payload is None:
+            raise DiffioApiError("payload is required")
+        if not isinstance(payload, (bytes, str)):
+            raise DiffioApiError("payload must be bytes or str")
+
+        webhook = Webhook(secret)
+        try:
+            event = webhook.verify(payload, _extract_svix_headers(headers))
+        except Exception as exc:
+            raise DiffioApiError(str(exc))
+        if not isinstance(event, dict):
+            raise DiffioApiError("Webhook payload must be an object")
+        return GenerationWebhookEvent.from_dict(event)
 
 
 class AudioIsolationClient:

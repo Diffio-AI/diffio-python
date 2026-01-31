@@ -237,21 +237,6 @@ class GenerationDownloadResponse:
         )
 
 
-class WebhookPortalResponse:
-    def __init__(self, portalUrl, mode, apiKeyId=None):
-        self.portalUrl = portalUrl
-        self.mode = mode
-        self.apiKeyId = apiKeyId
-
-    @classmethod
-    def from_dict(cls, data):
-        return cls(
-            portalUrl=data["portalUrl"],
-            mode=data.get("mode"),
-            apiKeyId=data.get("apiKeyId"),
-        )
-
-
 class WebhookTestEventResponse:
     def __init__(self, svixMessageId, eventId, eventType, mode, apiKeyId=None):
         self.svixMessageId = svixMessageId

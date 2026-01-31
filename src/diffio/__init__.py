@@ -24,7 +24,6 @@ from .types import (
     ProjectSummary,
     WebhookEventType,
     WebhookMode,
-    WebhookPortalResponse,
     WebhookTestEventResponse,
 )
 
@@ -51,7 +50,6 @@ __all__ = [
     "RequestOptions",
     "WebhookEventType",
     "WebhookMode",
-    "WebhookPortalResponse",
     "WebhookTestEventResponse",
     "WebhooksClient",
 ]

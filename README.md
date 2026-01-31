@@ -18,17 +18,11 @@ pip install -e .
 
 ## Configuration
 
-Set the API key with `DIFFIO_API_KEY`. You can also override the base URL with `DIFFIO_API_BASE_URL`.
+Set the API key with `DIFFIO_API_KEY`. If you need to set the base URL explicitly, use the production endpoint with `DIFFIO_API_BASE_URL`.
 
 ```bash
 export DIFFIO_API_KEY="diffio_live_..."
-export DIFFIO_API_BASE_URL="https://us-central1-diffioai.cloudfunctions.net"
-```
-
-For emulators, set the base URL to the Functions emulator host.
-
-```bash
-export DIFFIO_API_BASE_URL="http://127.0.0.1:5001/diffioai/us-central1"
+export DIFFIO_API_BASE_URL="https://us-central1-diffioai.cloudfunctions.net/v1"
 ```
 
 ## Request options
@@ -167,16 +161,6 @@ for generation in generations.generations:
     print(generation.generationId, generation.status)
 ```
 
-## Webhooks portal access
-
-```py
-from diffio import DiffioClient
-
-client = DiffioClient(apiKey="diffio_live_...")
-portal = client.webhooks.get_portal_access(mode="test")
-print(portal.portalUrl)
-```
-
 ## Send a test webhook event
 
 ```py
@@ -185,11 +169,39 @@ from diffio import DiffioClient
 client = DiffioClient(apiKey="diffio_live_...")
 event = client.webhooks.send_test_event(
     eventType="generation.completed",
-    mode="test",
+    mode="live",
     samplePayload={"apiProjectId": "proj_123"},
 )
 
 print(event.svixMessageId)
+```
+
+## Verify webhook signatures
+
+Use the raw request body (bytes) plus the `svix-*` headers and your webhook signing secret.
+
+```py
+from fastapi import FastAPI, Request, HTTPException
+from diffio import DiffioClient
+import os
+
+app = FastAPI()
+client = DiffioClient(apiKey=os.environ["DIFFIO_API_KEY"])
+
+@app.post("/webhooks/diffio")
+async def diffio_webhook(request: Request):
+    payload = await request.body()
+    headers = request.headers
+    try:
+        event = client.webhooks.verify_signature(
+            payload=payload,
+            headers=headers,
+            secret=os.environ["DIFFIO_WEBHOOK_SECRET"],
+        )
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    print("Webhook received", event.eventType)
+    return {"ok": True}
 ```
 
 ## Tutorials
