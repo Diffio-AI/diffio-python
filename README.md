@@ -22,7 +22,7 @@ Set the API key with `DIFFIO_API_KEY`. If you need to set the base URL explicitl
 
 ```bash
 export DIFFIO_API_KEY="diffio_live_..."
-export DIFFIO_API_BASE_URL="https://us-central1-diffioai.cloudfunctions.net/v1"
+export DIFFIO_API_BASE_URL="https://api.diffio.ai/v1"
 ```
 
 ## Request options

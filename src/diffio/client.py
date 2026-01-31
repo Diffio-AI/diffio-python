@@ -26,7 +26,7 @@ from .types import (
     WebhookTestEventResponse,
 )
 
-DEFAULT_BASE_URL = "https://us-central1-diffioai.cloudfunctions.net"
+DEFAULT_BASE_URL = "https://api.diffio.ai"
 API_PREFIX = "v1"
 MODEL_ENDPOINTS = {
     "diffio-2": "diffio-2.0-generation",

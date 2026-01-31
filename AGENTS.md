@@ -26,10 +26,11 @@
 * Pull requests should include a concise summary, any relevant issue links, and the exact test command used.
 * Include before and after notes when API behavior changes, plus doc updates in `README.md` when needed.
 
-## SDK Documentation Sync
-* Whenever you change the SDK, update the website API documentation in `app/components/docs/` to match the new behavior.
-* Before finishing any SDK update, use a sub agent to review and apply the documentation updates in `app/components/docs/`, and do not exit until that review is complete.
-* Before finishing any SDK update, use a sub agent to review `README.md`, apply any updates needed to match the code, and do not exit until that review is complete.
+## Hosted Docs (Required)
+* The public, hosted docs live under `app/pages/docs` (routes/pages) and `app/components/docs` (docs content/components).
+* Any SDK behavior change MUST be reflected in these hosted docs before finishing.
+* Use a subagent to perform the hosted docs updates and review; do not finish the task until the subagent reports back.
+* If you only update SDK code without updating `app/pages/docs` + `app/components/docs`, the task is incomplete.
 
 ## Configuration and Environment
 * Set `DIFFIO_API_KEY` for authenticated requests.
