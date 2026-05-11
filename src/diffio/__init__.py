@@ -1,13 +1,19 @@
 from .client import (
+    AccountClient,
+    ApiKeysClient,
     AudioIsolationClient,
     DiffioClient,
     GenerationsClient,
     ProjectsClient,
     RequestOptions,
+    UsageClient,
     WebhooksClient,
 )
 from .errors import DiffioApiError
 from .types import (
+    AccountSettingsResponse,
+    ApiKeyResponse,
+    ApiKeysListResponse,
     AudioIsolationResult,
     CreateGenerationResponse,
     CreateProjectResponse,
@@ -22,12 +28,19 @@ from .types import (
     ModelKey,
     ProjectGenerationSummary,
     ProjectSummary,
+    UsageSummaryResponse,
+    WebhookConfigureResponse,
     WebhookEventType,
     WebhookMode,
     WebhookTestEventResponse,
 )
 
 __all__ = [
+    "AccountClient",
+    "AccountSettingsResponse",
+    "ApiKeyResponse",
+    "ApiKeysClient",
+    "ApiKeysListResponse",
     "AudioIsolationClient",
     "AudioIsolationResult",
     "CreateGenerationResponse",
@@ -48,10 +61,13 @@ __all__ = [
     "ProjectSummary",
     "ProjectsClient",
     "RequestOptions",
+    "UsageClient",
+    "UsageSummaryResponse",
+    "WebhookConfigureResponse",
     "WebhookEventType",
     "WebhookMode",
     "WebhookTestEventResponse",
     "WebhooksClient",
 ]
 
-__version__ = "0.1.5"
+__version__ = "0.1.7"

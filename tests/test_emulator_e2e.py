@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from diffio import DiffioApiError, DiffioClient
-from emulator_api_key import create_emulator_api_key
+from emulator_api_key import EmulatorApiKeyError, create_emulator_api_key
 
 EMULATOR_BASE_URL = "http://127.0.0.1:5001/diffioai/us-central1"
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
@@ -33,7 +33,12 @@ def emulator_env() -> None:
 
 @pytest.fixture(scope="session")
 def emulator_api_key(emulator_env):
-    result = create_emulator_api_key()
+    try:
+        result = create_emulator_api_key()
+    except EmulatorApiKeyError as exc:
+        if "Upgrade to the Developer plan" in str(exc):
+            pytest.skip("Local emulator account cannot create API keys without the Developer plan.")
+        raise
     os.environ["DIFFIO_API_KEY"] = result.api_key
     return result
 

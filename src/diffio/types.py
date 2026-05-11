@@ -256,6 +256,119 @@ class WebhookTestEventResponse:
         )
 
 
+class AccountSettingsResponse:
+    def __init__(self, account, apiKeyId=None):
+        self.account = account
+        self.apiKeyId = apiKeyId
+
+    @classmethod
+    def from_dict(cls, data):
+        account = data.get("account")
+        if not isinstance(account, dict):
+            account = {}
+        return cls(account=account, apiKeyId=data.get("apiKeyId"))
+
+
+class ApiKeyResponse:
+    def __init__(
+        self,
+        keyId,
+        label,
+        status,
+        keyPrefix,
+        role,
+        scopes,
+        resourceBounds,
+        key=None,
+        parentKeyId=None,
+        createdAt=None,
+        rotatedAt=None,
+        revokedAt=None,
+        permissions=None,
+    ):
+        self.key = key
+        self.keyId = keyId
+        self.label = label
+        self.status = status
+        self.keyPrefix = keyPrefix
+        self.role = role
+        self.scopes = scopes
+        self.resourceBounds = resourceBounds
+        self.parentKeyId = parentKeyId
+        self.createdAt = createdAt
+        self.rotatedAt = rotatedAt
+        self.revokedAt = revokedAt
+        self.permissions = permissions
+
+    @classmethod
+    def from_dict(cls, data):
+        scopes = data.get("scopes")
+        if not isinstance(scopes, list):
+            scopes = []
+        resource_bounds = data.get("resourceBounds")
+        if not isinstance(resource_bounds, dict):
+            resource_bounds = {}
+        permissions = data.get("permissions")
+        if permissions is not None and not isinstance(permissions, dict):
+            permissions = None
+        return cls(
+            key=data.get("key"),
+            keyId=data["keyId"],
+            label=data.get("label") or "",
+            status=data.get("status") or "active",
+            keyPrefix=data.get("keyPrefix") or "",
+            role=data.get("role") or "scoped",
+            scopes=[str(scope) for scope in scopes],
+            resourceBounds=resource_bounds,
+            parentKeyId=data.get("parentKeyId"),
+            createdAt=data.get("createdAt"),
+            rotatedAt=data.get("rotatedAt"),
+            revokedAt=data.get("revokedAt"),
+            permissions=permissions,
+        )
+
+
+class ApiKeysListResponse:
+    def __init__(self, keys):
+        self.keys = keys
+
+    @classmethod
+    def from_dict(cls, data):
+        items = data.get("keys")
+        if not isinstance(items, list):
+            items = []
+        keys = [ApiKeyResponse.from_dict(item) for item in items if isinstance(item, dict)]
+        return cls(keys=keys)
+
+
+class UsageSummaryResponse:
+    def __init__(self, usage, billing):
+        self.usage = usage
+        self.billing = billing
+
+    @classmethod
+    def from_dict(cls, data):
+        usage = data.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
+        billing = data.get("billing")
+        if not isinstance(billing, dict):
+            billing = {}
+        return cls(usage=usage, billing=billing)
+
+
+class WebhookConfigureResponse:
+    def __init__(self, webhook):
+        self.webhook = webhook
+
+    @classmethod
+    def from_dict(cls, data):
+        webhook = data.get("webhook")
+        if not isinstance(webhook, dict):
+            webhook = {}
+        return cls(webhook=webhook)
+
+
 class GenerationWebhookEvent:
     def __init__(
         self,
@@ -306,8 +419,8 @@ class AudioIsolationResult:
         self.generation = generation
 
 
-ModelKey = ("diffio-2", "diffio-2-flash", "diffio-3")
-DownloadType = ("audio", "mp3", "video")
+ModelKey = ("diffio-2", "diffio-2-flash", "diffio-3", "diffio-3.4", "diffio-3.5")
+DownloadType = ("audio", "mp3", "video", "transcript")
 WebhookMode = ("test", "live")
 WebhookEventType = (
     "generation.queued",

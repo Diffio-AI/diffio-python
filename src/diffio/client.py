@@ -11,6 +11,9 @@ from svix.webhooks import Webhook
 
 from .errors import DiffioApiError
 from .types import (
+    AccountSettingsResponse,
+    ApiKeyResponse,
+    ApiKeysListResponse,
     AudioIsolationResult,
     CreateGenerationResponse,
     CreateProjectResponse,
@@ -21,6 +24,8 @@ from .types import (
     ListProjectGenerationsResponse,
     ListProjectsResponse,
     ModelKey,
+    UsageSummaryResponse,
+    WebhookConfigureResponse,
     WebhookEventType,
     WebhookMode,
     WebhookTestEventResponse,
@@ -32,6 +37,8 @@ MODEL_ENDPOINTS = {
     "diffio-2": "diffio-2.0-generation",
     "diffio-2-flash": "diffio-2.0-flash-generation",
     "diffio-3": "diffio-3.0-generation",
+    "diffio-3.4": "diffio-3.4-generation",
+    "diffio-3.5": "diffio-3.5-generation",
 }
 DEFAULT_RETRY_STATUS_CODES = [408, 429, 500, 502, 503, 504]
 DEFAULT_RETRY_BACKOFF = 0.5
@@ -175,6 +182,9 @@ class DiffioClient:
         self.audio_isolation = AudioIsolationClient(self)
         self.generations = GenerationsClient(self)
         self.projects = ProjectsClient(self)
+        self.account = AccountClient(self)
+        self.api_keys = ApiKeysClient(self)
+        self.usage = UsageClient(self)
         self.webhooks = WebhooksClient(self)
 
     def __enter__(self):
@@ -575,6 +585,112 @@ class DiffioClient:
         )
         return WebhookTestEventResponse.from_dict(response)
 
+    def get_account_settings(self, *, requestOptions=None):
+        response = self._request(
+            "POST",
+            "account/settings/get",
+            json_payload={},
+            requestOptions=requestOptions,
+        )
+        return AccountSettingsResponse.from_dict(response)
+
+    def update_account_settings(self, *, billingPolicy, requestOptions=None):
+        if not isinstance(billingPolicy, dict):
+            raise ValueError("billingPolicy must be an object")
+        response = self._request(
+            "POST",
+            "account/settings/update",
+            json_payload={"billingPolicy": billingPolicy},
+            requestOptions=requestOptions,
+        )
+        return AccountSettingsResponse.from_dict(response)
+
+    def create_api_key(self, *, label, scopes, resourceBounds=None, requestOptions=None):
+        if not label:
+            raise ValueError("label is required")
+        if not isinstance(scopes, list):
+            raise ValueError("scopes must be a list")
+        response = self._request(
+            "POST",
+            "api_keys/create",
+            json_payload={
+                "label": label,
+                "scopes": scopes,
+                "resourceBounds": resourceBounds or {},
+            },
+            requestOptions=requestOptions,
+        )
+        return ApiKeyResponse.from_dict(response)
+
+    def list_api_keys(self, *, requestOptions=None):
+        response = self._request(
+            "POST",
+            "api_keys/list",
+            json_payload={},
+            requestOptions=requestOptions,
+        )
+        return ApiKeysListResponse.from_dict(response)
+
+    def rotate_api_key(self, *, keyId, requestOptions=None):
+        if not keyId:
+            raise ValueError("keyId is required")
+        response = self._request(
+            "POST",
+            "api_keys/rotate",
+            json_payload={"keyId": keyId},
+            requestOptions=requestOptions,
+        )
+        return ApiKeyResponse.from_dict(response)
+
+    def revoke_api_key(self, *, keyId, requestOptions=None):
+        if not keyId:
+            raise ValueError("keyId is required")
+        response = self._request(
+            "POST",
+            "api_keys/revoke",
+            json_payload={"keyId": keyId},
+            requestOptions=requestOptions,
+        )
+        return ApiKeyResponse.from_dict(response)
+
+    def get_usage_summary(self, *, apiKeyId=None, requestOptions=None):
+        payload = {}
+        if apiKeyId is not None:
+            payload["apiKeyId"] = apiKeyId
+        response = self._request(
+            "POST",
+            "usage/summary",
+            json_payload=payload,
+            requestOptions=requestOptions,
+        )
+        return UsageSummaryResponse.from_dict(response)
+
+    def configure_webhook(
+        self,
+        *,
+        mode,
+        url,
+        eventTypes,
+        apiKeyId=None,
+        requestOptions=None,
+    ):
+        if mode not in WebhookMode:
+            raise ValueError("mode must be test or live")
+        if not url:
+            raise ValueError("url is required")
+        if not isinstance(eventTypes, list) or not eventTypes:
+            raise ValueError("eventTypes must be a non-empty list")
+        payload = {"mode": mode, "url": url, "eventTypes": eventTypes}
+        if apiKeyId is not None:
+            payload["apiKeyId"] = apiKeyId
+        response = self._request(
+            "POST",
+            "webhooks/configure",
+            json_payload=payload,
+            requestOptions=requestOptions,
+        )
+        return WebhookConfigureResponse.from_dict(response)
+
     def restore_audio(
         self,
         *,
@@ -660,6 +776,50 @@ class DiffioClient:
                 continue
 
             return _raise_for_error(response)
+
+
+class AccountClient:
+    def __init__(self, parent):
+        self._parent = parent
+
+    def get_settings(self, *, requestOptions=None):
+        return self._parent.get_account_settings(requestOptions=requestOptions)
+
+    def update_settings(self, *, billingPolicy, requestOptions=None):
+        return self._parent.update_account_settings(
+            billingPolicy=billingPolicy,
+            requestOptions=requestOptions,
+        )
+
+
+class ApiKeysClient:
+    def __init__(self, parent):
+        self._parent = parent
+
+    def create(self, *, label, scopes, resourceBounds=None, requestOptions=None):
+        return self._parent.create_api_key(
+            label=label,
+            scopes=scopes,
+            resourceBounds=resourceBounds,
+            requestOptions=requestOptions,
+        )
+
+    def list(self, *, requestOptions=None):
+        return self._parent.list_api_keys(requestOptions=requestOptions)
+
+    def rotate(self, *, keyId, requestOptions=None):
+        return self._parent.rotate_api_key(keyId=keyId, requestOptions=requestOptions)
+
+    def revoke(self, *, keyId, requestOptions=None):
+        return self._parent.revoke_api_key(keyId=keyId, requestOptions=requestOptions)
+
+
+class UsageClient:
+    def __init__(self, parent):
+        self._parent = parent
+
+    def summary(self, *, apiKeyId=None, requestOptions=None):
+        return self._parent.get_usage_summary(apiKeyId=apiKeyId, requestOptions=requestOptions)
 
 
 class GenerationsClient:
@@ -849,6 +1009,23 @@ class WebhooksClient:
             mode=mode,
             apiKeyId=apiKeyId,
             samplePayload=samplePayload,
+            requestOptions=requestOptions,
+        )
+
+    def configure(
+        self,
+        *,
+        mode,
+        url,
+        eventTypes,
+        apiKeyId=None,
+        requestOptions=None,
+    ):
+        return self._parent.configure_webhook(
+            mode=mode,
+            url=url,
+            eventTypes=eventTypes,
+            apiKeyId=apiKeyId,
             requestOptions=requestOptions,
         )
 
@@ -1151,9 +1328,9 @@ def _normalize_download_type(download_type):
         return None, None
     if download_type == "mp3":
         return "audio", "mp3"
-    if download_type in {"audio", "video"}:
+    if download_type in {"audio", "video", "transcript"}:
         return download_type, download_type
-    raise ValueError("downloadType must be audio, mp3, or video")
+    raise ValueError("downloadType must be audio, mp3, video, or transcript")
 
 
 def _extension_from_file_name(file_name):
@@ -1190,6 +1367,8 @@ def _extension_from_url(download_url):
 def _expected_download_extension(download):
     if download.downloadType == "audio":
         return ".mp3"
+    if download.downloadType == "transcript":
+        return ".json"
     if download.downloadType == "video":
         return (
             _extension_from_file_name(download.fileName)

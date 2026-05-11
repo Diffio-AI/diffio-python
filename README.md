@@ -59,7 +59,7 @@ project = client.create_project(
 
 generation = client.create_generation(
     apiProjectId=project.apiProjectId,
-    model="diffio-2",
+    model="diffio-3.5",
     sampling={"steps": 12, "guidance": 1.5},
 )
 
@@ -74,7 +74,7 @@ from diffio import DiffioClient
 client = DiffioClient(apiKey="diffio_live_...")
 result = client.audio_isolation.isolate(
     filePath="sample.wav",
-    model="diffio-2",
+    model="diffio-3.5",
     sampling={"steps": 12, "guidance": 1.5},
 )
 
@@ -91,7 +91,7 @@ from diffio import DiffioClient
 client = DiffioClient(apiKey="diffio_live_...")
 audio_bytes, info = client.restore_audio(
     filePath="sample.wav",
-    model="diffio-2",
+    model="diffio-3.5",
     sampling={"steps": 12, "guidance": 1.5},
     onProgress=lambda progress: print(progress.status),
 )
@@ -136,6 +136,36 @@ print(download.downloadUrl)
 ```
 
 If you only need the URL, use `client.generations.get_download`.
+
+Set `downloadType="transcript"` to download the transcript JSON artifact when the generation has one.
+
+```py
+transcript = client.generations.download(
+    generationId="gen_123",
+    apiProjectId="proj_123",
+    downloadType="transcript",
+    downloadFilePath="word_timestamps.json",
+)
+```
+
+## Account, keys, usage, and webhook configuration
+
+Agent keys can manage account settings, scoped keys, usage, and webhook endpoints.
+
+```py
+settings = client.account.get_settings()
+key = client.api_keys.create(
+    label="Backend worker",
+    scopes=["projects:read", "projects:write", "generations:read", "generations:write", "artifacts:read"],
+)
+usage = client.usage.summary(apiKeyId=key.keyId)
+webhook = client.webhooks.configure(
+    mode="live",
+    url="https://example.com/webhooks/diffio",
+    eventTypes=["generation.completed", "generation.failed"],
+    apiKeyId=key.keyId,
+)
+```
 
 ## List projects
 

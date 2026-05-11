@@ -283,6 +283,34 @@ def test_audio_isolation_isolate_runs_full_flow(tmp_path: Path):
     assert calls[2][0] == "POST"
 
 
+def test_create_generation_routes_to_diffio_3_5_endpoint():
+    received = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received["path"] = request.url.path
+        payload = json.loads(request.content.decode("utf-8"))
+        received["payload"] = payload
+        return httpx.Response(
+            200,
+            json={
+                "generationId": "gen_35",
+                "apiProjectId": "proj_35",
+                "modelKey": "diffio-3.5",
+                "status": "queued",
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    http_client = httpx.Client(base_url="https://api.test", transport=transport)
+    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
+
+    response = client.create_generation(apiProjectId="proj_35", model="diffio-3.5")
+
+    assert received["path"] == "/v1/diffio-3.5-generation"
+    assert received["payload"]["apiProjectId"] == "proj_35"
+    assert response.modelKey == "diffio-3.5"
+
+
 def test_restore_audio_runs_full_flow_and_downloads(tmp_path: Path, monkeypatch):
     status_sequence = ["queued", "processing", "complete"]
 
@@ -501,6 +529,43 @@ def test_get_generation_download_payload_and_response():
     assert download.mimeType == "audio/mpeg"
 
 
+def test_get_generation_download_accepts_transcript():
+    received = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received["path"] = request.url.path
+        payload = json.loads(request.content.decode("utf-8"))
+        received["payload"] = payload
+        return httpx.Response(
+            200,
+            json={
+                "generationId": "gen_456",
+                "apiProjectId": "proj_456",
+                "downloadType": "transcript",
+                "downloadUrl": "https://storage.test/word_timestamps.json",
+                "fileName": "word_timestamps.json",
+                "storagePath": "users/u/projects/proj_456/generations/gen_456/word_timestamps.json",
+                "bucket": "diffio_api",
+                "mimeType": "application/json",
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    http_client = httpx.Client(base_url="https://api.test", transport=transport)
+    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
+
+    download = client.generations.get_download(
+        generationId="gen_456",
+        apiProjectId="proj_456",
+        downloadType="transcript",
+    )
+
+    assert received["path"] == "/v1/get_generation_download"
+    assert received["payload"]["downloadType"] == "transcript"
+    assert download.downloadType == "transcript"
+    assert download.mimeType == "application/json"
+
+
 def test_generation_download_writes_file(tmp_path: Path):
     received = {}
 
@@ -697,6 +762,80 @@ def test_webhooks_send_test_event_payload_and_response():
     assert response.svixMessageId == "msg_123"
     assert response.eventId == "evt_123"
     assert response.eventType == "generation.completed"
+
+
+def test_account_keys_usage_and_webhook_configure_endpoints():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode("utf-8"))
+        calls.append((request.url.path, payload))
+        if request.url.path == "/v1/account/settings/get":
+            return httpx.Response(
+                200,
+                json={
+                    "apiKeyId": "agent_1",
+                    "account": {"userId": "user_1", "billingPolicy": {"type": "internalDiffio"}},
+                },
+            )
+        if request.url.path == "/v1/api_keys/create":
+            return httpx.Response(
+                200,
+                json={
+                    "key": "diffio_live_new",
+                    "keyId": "key_1",
+                    "label": "VFC worker",
+                    "status": "active",
+                    "keyPrefix": "diffio_live_",
+                    "role": "scoped",
+                    "scopes": ["projects:read", "projects:write"],
+                    "resourceBounds": {},
+                    "parentKeyId": "agent_1",
+                },
+            )
+        if request.url.path == "/v1/usage/summary":
+            return httpx.Response(
+                200,
+                json={
+                    "usage": {"apiKeyId": "key_1", "periods": []},
+                    "billing": {"billingPolicy": {"type": "internalDiffio"}},
+                },
+            )
+        if request.url.path == "/v1/webhooks/configure":
+            return httpx.Response(
+                200,
+                json={
+                    "webhook": {
+                        "apiKeyId": "key_1",
+                        "mode": "live",
+                        "endpointId": "ep_1",
+                    }
+                },
+            )
+        return httpx.Response(404, json={"error": "not found"})
+
+    transport = httpx.MockTransport(handler)
+    http_client = httpx.Client(base_url="https://api.test", transport=transport)
+    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
+
+    settings = client.account.get_settings()
+    key = client.api_keys.create(label="VFC worker", scopes=["projects:read", "projects:write"])
+    usage = client.usage.summary(apiKeyId="key_1")
+    webhook = client.webhooks.configure(
+        mode="live",
+        url="https://example.com/webhook",
+        eventTypes=["generation.completed"],
+        apiKeyId="key_1",
+    )
+
+    assert settings.account["billingPolicy"]["type"] == "internalDiffio"
+    assert key.key == "diffio_live_new"
+    assert usage.billing["billingPolicy"]["type"] == "internalDiffio"
+    assert webhook.webhook["endpointId"] == "ep_1"
+    assert calls[1] == (
+        "/v1/api_keys/create",
+        {"label": "VFC worker", "scopes": ["projects:read", "projects:write"], "resourceBounds": {}},
+    )
 
 
 def test_webhooks_send_test_event_rejects_invalid_type():
