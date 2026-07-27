@@ -1,17 +1,23 @@
 name: Publish Python SDK
+run-name: >-
+  Publish Python SDK${{ github.event_name == 'repository_dispatch' && format(' for API production {0}', github.event.client_payload.production_sha) || '' }}
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - "**"
-      - ".github/workflows/publish-python.yml"
-  workflow_dispatch: {}
+  repository_dispatch:
+    types: [api-production-deployed]
+  workflow_dispatch:
+    inputs:
+      production_sha:
+        description: Production API commit that prompted this release
+        required: false
+        type: string
+
+concurrency:
+  group: publish-python-sdk
+  cancel-in-progress: false
 
 jobs:
   publish:
-    if: ${{ github.actor != 'github-actions[bot]' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
