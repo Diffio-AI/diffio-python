@@ -61,10 +61,16 @@ generation = client.create_generation(
     apiProjectId=project.apiProjectId,
     model="diffio-3.5",
     sampling={"steps": 12, "guidance": 1.5},
+    idempotencyKey="restore-job-2026-001",
 )
 
 print(generation.generationId)
+print(generation.idempotentReplay)
 ```
+
+Use one stable `idempotencyKey` for every retry of the same logical generation request.
+The response's optional `idempotentReplay` value is `True` when the API returns the
+result of an earlier request with that key. Use a new key for a different generation.
 
 ## Audio isolation helper
 

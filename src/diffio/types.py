@@ -76,11 +76,19 @@ class ListProjectsResponse:
 
 
 class CreateGenerationResponse:
-    def __init__(self, generationId, apiProjectId, modelKey, status):
+    def __init__(
+        self,
+        generationId,
+        apiProjectId,
+        modelKey,
+        status,
+        idempotentReplay=None,
+    ):
         self.generationId = generationId
         self.apiProjectId = apiProjectId
         self.modelKey = modelKey
         self.status = status
+        self.idempotentReplay = idempotentReplay
 
     @classmethod
     def from_dict(cls, data):
@@ -89,6 +97,7 @@ class CreateGenerationResponse:
             apiProjectId=data["apiProjectId"],
             modelKey=data["modelKey"],
             status=data["status"],
+            idempotentReplay=data.get("idempotentReplay"),
         )
 
 

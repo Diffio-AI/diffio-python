@@ -309,7 +309,136 @@ def test_create_generation_routes_to_diffio_3_5_endpoint():
 
     assert received["path"] == "/v1/diffio-3.5-generation"
     assert received["payload"]["apiProjectId"] == "proj_35"
+    assert "idempotencyKey" not in received["payload"]
     assert response.modelKey == "diffio-3.5"
+    assert response.idempotentReplay is None
+
+
+def test_create_generation_sends_idempotency_key_and_parses_replay():
+    received = {}
+
+    def handler(request):
+        received["path"] = request.url.path
+        received["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={
+                "generationId": "gen_original",
+                "apiProjectId": "proj_123",
+                "modelKey": "diffio-2",
+                "status": "queued",
+                "idempotentReplay": True,
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    http_client = httpx.Client(base_url="https://api.test", transport=transport)
+    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
+
+    response = client.create_generation(
+        apiProjectId="proj_123",
+        idempotencyKey="restore-job-2026-001",
+    )
+
+    assert received["path"] == "/v1/diffio-2.0-generation"
+    assert received["payload"] == {
+        "apiProjectId": "proj_123",
+        "idempotencyKey": "restore-job-2026-001",
+    }
+    assert response.generationId == "gen_original"
+    assert response.idempotentReplay is True
+
+
+def test_generations_create_forwards_idempotency_key():
+    received = {}
+
+    def handler(request):
+        received["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={
+                "generationId": "gen_123",
+                "apiProjectId": "proj_123",
+                "modelKey": "diffio-2",
+                "status": "queued",
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    http_client = httpx.Client(base_url="https://api.test", transport=transport)
+    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
+
+    response = client.generations.create(
+        apiProjectId="proj_123",
+        idempotencyKey="restore-job-2026-wrapper",
+    )
+
+    assert received["payload"]["idempotencyKey"] == "restore-job-2026-wrapper"
+    assert response.idempotentReplay is None
+
+
+def test_generations_create_and_wait_forwards_idempotency_key():
+    received = {}
+
+    def handler(request):
+        if request.url.path == "/v1/diffio-2.0-generation":
+            received["createPayload"] = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={
+                    "generationId": "gen_123",
+                    "apiProjectId": "proj_123",
+                    "modelKey": "diffio-2",
+                    "status": "queued",
+                    "idempotentReplay": False,
+                },
+            )
+        if request.url.path == "/v1/get_generation_progress":
+            return httpx.Response(
+                200,
+                json={
+                    "generationId": "gen_123",
+                    "apiProjectId": "proj_123",
+                    "status": "complete",
+                    "hasVideo": False,
+                    "preProcessing": {
+                        "jobId": "job-pre",
+                        "jobState": "SUCCEEDED",
+                        "status": "complete",
+                        "progress": 100,
+                        "statusMessage": None,
+                        "error": None,
+                        "errorDetails": None,
+                    },
+                    "inference": {
+                        "jobId": "job-run",
+                        "jobState": "SUCCEEDED",
+                        "status": "complete",
+                        "progress": 100,
+                        "statusMessage": None,
+                        "error": None,
+                        "errorDetails": None,
+                    },
+                },
+            )
+        return httpx.Response(404, json={"error": "not found"})
+
+    transport = httpx.MockTransport(handler)
+    http_client = httpx.Client(base_url="https://api.test", transport=transport)
+    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
+
+    generation, progress = client.generations.create_and_wait(
+        apiProjectId="proj_123",
+        idempotencyKey="restore-job-2026-002",
+        pollInterval=0,
+    )
+
+    assert received["createPayload"] == {
+        "apiProjectId": "proj_123",
+        "idempotencyKey": "restore-job-2026-002",
+    }
+    assert generation.idempotentReplay is False
+    assert progress.status == "complete"
 
 
 def test_advertised_models_match_runtime_model_support():
