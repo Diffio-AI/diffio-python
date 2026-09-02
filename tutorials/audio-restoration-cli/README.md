@@ -40,7 +40,7 @@ python tutorials/audio-restoration-cli/run.py --api-key diffio_live_... --input 
 
 - The script infers the content type from the file extension. If the extension is uncommon, update run.py to pass a contentType value.
 - The output file defaults to restored.mp3.
-- Use --model to switch models, the default is diffio-3.
+- Use --model to switch models, the default is diffio-3.5.
 - Use --poll-interval to control how often progress is checked.
 
 ## Troubleshooting

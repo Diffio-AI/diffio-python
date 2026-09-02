@@ -5,7 +5,8 @@ from pathlib import Path
 import httpx
 import pytest
 
-from diffio import DiffioClient
+from diffio import DiffioClient, ModelKey
+from diffio.client import MODEL_ENDPOINTS
 
 
 def test_create_project_payload_and_headers(tmp_path: Path):
@@ -311,6 +312,13 @@ def test_create_generation_routes_to_diffio_3_5_endpoint():
     assert response.modelKey == "diffio-3.5"
 
 
+def test_advertised_models_match_runtime_model_support():
+    assert set(ModelKey) == set(MODEL_ENDPOINTS)
+    assert "diffio-3" not in ModelKey
+    assert "diffio-3.0-generation" not in MODEL_ENDPOINTS.values()
+    assert MODEL_ENDPOINTS["diffio-3.4"] == "diffio-3.4-generation"
+
+
 def test_restore_audio_runs_full_flow_and_downloads(tmp_path: Path, monkeypatch):
     status_sequence = ["queued", "processing", "complete"]
 
@@ -437,6 +445,18 @@ def test_create_generation_rejects_unknown_model():
 
     with pytest.raises(ValueError):
         client.create_generation(apiProjectId="proj", model="diffio-unknown")
+
+
+def test_create_generation_rejects_diffio_3():
+    def handler(request):
+        raise AssertionError("Unsupported models must be rejected before an HTTP request")
+
+    transport = httpx.MockTransport(handler)
+    http_client = httpx.Client(base_url="https://api.test", transport=transport)
+    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
+
+    with pytest.raises(ValueError, match="Unsupported model: diffio-3"):
+        client.create_generation(apiProjectId="proj", model="diffio-3")
 
 
 def test_get_generation_progress_payload_and_response():
