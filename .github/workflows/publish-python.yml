@@ -34,10 +34,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install build tools
+      - name: Install development tools
         run: |
           python -m pip install --upgrade pip
-          python -m pip install build
+          python -m pip install -r requirements-dev.txt
 
       - name: Decide version
         id: version
@@ -139,6 +139,9 @@ jobs:
               if updated_init != init_text:
                   init_path.write_text(updated_init)
           PY
+
+      - name: Test
+        run: python -m pytest tests/test_client.py
 
       - name: Build
         if: ${{ steps.version.outputs.publish == 'true' }}

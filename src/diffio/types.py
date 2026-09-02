@@ -419,7 +419,7 @@ class AudioIsolationResult:
         self.generation = generation
 
 
-ModelKey = ("diffio-2", "diffio-2-flash", "diffio-3", "diffio-3.4", "diffio-3.5")
+ModelKey = ("diffio-2", "diffio-2-flash", "diffio-3.4", "diffio-3.5")
 DownloadType = ("audio", "mp3", "video", "transcript")
 WebhookMode = ("test", "live")
 WebhookEventType = (

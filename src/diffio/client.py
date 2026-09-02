@@ -36,7 +36,6 @@ API_PREFIX = "v1"
 MODEL_ENDPOINTS = {
     "diffio-2": "diffio-2.0-generation",
     "diffio-2-flash": "diffio-2.0-flash-generation",
-    "diffio-3": "diffio-3.0-generation",
     "diffio-3.4": "diffio-3.4-generation",
     "diffio-3.5": "diffio-3.5-generation",
 }
