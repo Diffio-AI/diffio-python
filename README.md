@@ -30,6 +30,14 @@ export DIFFIO_API_BASE_URL="https://api.diffio.ai/v1"
 Use request options to override headers, timeouts, retries, or the API key per request.
 You can also pass `timeoutInSeconds` as an alias for `timeout`.
 
+Generation creation is retried only when you supply a non-empty `idempotencyKey`,
+even when `maxRetries` is configured globally or per request. Without a key, a
+timeout or lost response can hide an accepted generation, so the SDK returns the
+error after the first attempt. With a key, retries send the same key and payload.
+Reuse that key when manually retrying the same operation; use a new key for a new
+generation. The audio isolation and restore helpers do not supply a key and do
+not automatically retry their generation-creation step.
+
 ```py
 from diffio import DiffioClient, RequestOptions
 
@@ -62,6 +70,7 @@ generation = client.create_generation(
     model="diffio-3.5",
     sampling={"steps": 12, "guidance": 1.5},
     idempotencyKey="restore-job-2026-001",
+    requestOptions={"maxRetries": 2},
 )
 
 print(generation.generationId)
@@ -112,6 +121,11 @@ print(info["apiProjectId"], info["generationId"])
 ```
 
 ## Generation progress
+
+`wait_for_generation` and `generations.wait_for_complete` wait for the overall
+`status` to become `complete`. Individual stages can reach 100% while video
+restoration or final settlement is still pending; stage progress alone does not
+indicate overall completion.
 
 ```py
 from diffio import DiffioClient

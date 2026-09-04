@@ -7,6 +7,7 @@ import pytest
 
 from diffio import DiffioClient, ModelKey
 from diffio.client import MODEL_ENDPOINTS
+from diffio.errors import DiffioApiError
 
 
 def test_create_project_payload_and_headers(tmp_path: Path):
@@ -997,3 +998,124 @@ def test_webhooks_send_test_event_rejects_invalid_type():
             eventType="generation.unknown",
             mode="test",
         )
+
+
+@pytest.mark.parametrize("failure_kind", ["status", "transport"])
+@pytest.mark.parametrize("model", list(MODEL_ENDPOINTS))
+@pytest.mark.parametrize("options_scope", ["client", "request"])
+@pytest.mark.parametrize("idempotency_key", [None, "", "   ", 123])
+def test_create_generation_does_not_retry_without_usable_idempotency_key(
+    failure_kind, model, options_scope, idempotency_key
+):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if failure_kind == "transport":
+            raise httpx.ReadTimeout("Response lost after acceptance", request=request)
+        return httpx.Response(503, json={"error": "unavailable"})
+
+    retry_options = {"maxRetries": 2, "retryBackoff": 0}
+    with httpx.Client(base_url="https://api.test", transport=httpx.MockTransport(handler)) as http_client:
+        client = DiffioClient(
+            apiKey="diffio_live_test",
+            baseUrl="https://api.test",
+            httpClient=http_client,
+            requestOptions=retry_options if options_scope == "client" else None,
+        )
+        expected_error = httpx.ReadTimeout if failure_kind == "transport" else DiffioApiError
+        with pytest.raises(expected_error):
+            client.generations.create(
+                apiProjectId="proj",
+                model=model,
+                idempotencyKey=idempotency_key,
+                requestOptions=retry_options if options_scope == "request" else None,
+            )
+
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("failure_kind", ["status", "transport"])
+@pytest.mark.parametrize("model", list(MODEL_ENDPOINTS))
+@pytest.mark.parametrize("options_scope", ["client", "request"])
+def test_create_generation_retries_same_idempotent_request(failure_kind, model, options_scope):
+    calls = []
+
+    def handler(request):
+        calls.append(request.content)
+        if len(calls) == 1:
+            if failure_kind == "transport":
+                raise httpx.ReadTimeout("Response lost after acceptance", request=request)
+            return httpx.Response(503, json={"error": "unavailable"})
+        return httpx.Response(
+            200,
+            json={
+                "generationId": "gen_original",
+                "apiProjectId": "proj",
+                "modelKey": model,
+                "status": "queued",
+                "idempotentReplay": True,
+            },
+        )
+
+    retry_options = {"maxRetries": 2, "retryBackoff": 0}
+    with httpx.Client(base_url="https://api.test", transport=httpx.MockTransport(handler)) as http_client:
+        client = DiffioClient(
+            apiKey="diffio_live_test",
+            baseUrl="https://api.test",
+            httpClient=http_client,
+            requestOptions=retry_options if options_scope == "client" else None,
+        )
+        generation = client.generations.create(
+            apiProjectId="proj",
+            model=model,
+            idempotencyKey="customer-operation-1",
+            sampling={"steps": 12},
+            params={"seed": 42},
+            requestOptions=retry_options if options_scope == "request" else None,
+        )
+
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert json.loads(calls[1])["idempotencyKey"] == "customer-operation-1"
+    assert generation.generationId == "gen_original"
+    assert generation.idempotentReplay is True
+
+
+def test_wait_for_generation_waits_for_overall_completion_after_stage_completion():
+    responses = [
+        ("pending", "pending", 0),
+        ("processing", "running", 20),
+        ("processing", "complete", 100),
+        ("complete", "complete", 100),
+    ]
+    progress_calls = []
+
+    def handler(request):
+        status, video_status, video_progress = responses.pop(0)
+        return httpx.Response(
+            200,
+            json={
+                "generationId": "gen_video",
+                "apiProjectId": "proj",
+                "status": status,
+                "hasVideo": True,
+                "preProcessing": {"status": "complete", "progress": 100},
+                "inference": {"status": "complete", "progress": 100},
+                "restoredVideo": {"status": video_status, "progress": video_progress},
+            },
+        )
+
+    with httpx.Client(base_url="https://api.test", transport=httpx.MockTransport(handler)) as http_client:
+        client = DiffioClient(apiKey="diffio_live_test", httpClient=http_client)
+        progress = client.generations.wait_for_complete(
+            generationId="gen_video",
+            apiProjectId="proj",
+            pollInterval=0,
+            timeout=5,
+            onProgress=lambda progress: progress_calls.append(progress.status),
+        )
+
+    assert progress.status == "complete"
+    assert progress_calls == ["pending", "processing", "processing", "complete"]
+    assert not responses

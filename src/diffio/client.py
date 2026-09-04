@@ -311,6 +311,7 @@ class DiffioClient:
         idempotencyKey=None,
         requestOptions=None,
     ):
+        """Create a generation; automatic retries require a supplied idempotency key."""
         endpoint = MODEL_ENDPOINTS.get(model)
         if not endpoint:
             raise ValueError(f"Unsupported model: {model}")
@@ -323,7 +324,13 @@ class DiffioClient:
         if idempotencyKey is not None:
             payload["idempotencyKey"] = idempotencyKey
 
-        response = self._request("POST", endpoint, json_payload=payload, requestOptions=requestOptions)
+        response = self._request(
+            "POST",
+            endpoint,
+            json_payload=payload,
+            requestOptions=requestOptions,
+            allow_retries=isinstance(idempotencyKey, str) and bool(idempotencyKey.strip()),
+        )
         return CreateGenerationResponse.from_dict(response)
 
     def list_projects(self, *, requestOptions=None):
@@ -734,7 +741,7 @@ class DiffioClient:
             raiseOnError=raiseOnError,
         )
 
-    def _request(self, method, path, *, json_payload, requestOptions=None):
+    def _request(self, method, path, *, json_payload, requestOptions=None, allow_retries=True):
         request_path = path.lstrip("/")
         if self._api_prefix:
             request_path = f"{self._api_prefix}/{request_path}"
@@ -743,6 +750,9 @@ class DiffioClient:
         headers = _merge_headers({"Authorization": f"Bearer {api_key}"}, merged_options.headers)
         timeout = merged_options.timeout
         max_retries = merged_options.maxRetries if merged_options.maxRetries is not None else 0
+        # A lost response can hide an accepted generation; only its stable key makes replay safe.
+        if not allow_retries:
+            max_retries = 0
         retry_backoff = (
             merged_options.retryBackoff if merged_options.retryBackoff is not None else DEFAULT_RETRY_BACKOFF
         )
