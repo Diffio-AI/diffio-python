@@ -172,6 +172,15 @@ class GenerationProgressStage:
         )
 
 
+class GenerationTranscription:
+    def __init__(self, status):
+        self.status = status
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(status=data["status"])
+
+
 class GenerationProgressResponse:
     def __init__(
         self,
@@ -184,6 +193,7 @@ class GenerationProgressResponse:
         restoredVideo,
         error,
         errorDetails,
+        transcription=None,
     ):
         self.generationId = generationId
         self.apiProjectId = apiProjectId
@@ -194,10 +204,12 @@ class GenerationProgressResponse:
         self.restoredVideo = restoredVideo
         self.error = error
         self.errorDetails = errorDetails
+        self.transcription = transcription
 
     @classmethod
     def from_dict(cls, data):
         restored_video = data.get("restoredVideo")
+        transcription = data.get("transcription")
         return cls(
             generationId=data["generationId"],
             apiProjectId=data["apiProjectId"],
@@ -208,6 +220,10 @@ class GenerationProgressResponse:
             restoredVideo=(GenerationProgressStage.from_dict(restored_video) if restored_video else None),
             error=data.get("error"),
             errorDetails=data.get("errorDetails"),
+            transcription=(
+                GenerationTranscription.from_dict(transcription)
+                if transcription is not None else None
+            ),
         )
 
 
@@ -392,6 +408,7 @@ class GenerationWebhookEvent:
         modelKey,
         error,
         errorDetails,
+        transcription=None,
     ):
         self.eventType = eventType
         self.eventId = eventId
@@ -404,9 +421,11 @@ class GenerationWebhookEvent:
         self.modelKey = modelKey
         self.error = error
         self.errorDetails = errorDetails
+        self.transcription = transcription
 
     @classmethod
     def from_dict(cls, data):
+        transcription = data.get("transcription")
         return cls(
             eventType=data["eventType"],
             eventId=data["eventId"],
@@ -419,6 +438,10 @@ class GenerationWebhookEvent:
             modelKey=data.get("modelKey"),
             error=data.get("error"),
             errorDetails=data.get("errorDetails"),
+            transcription=(
+                GenerationTranscription.from_dict(transcription)
+                if transcription is not None else None
+            ),
         )
 
 
@@ -438,3 +461,4 @@ WebhookEventType = (
     "generation.completed",
 )
 GenerationWebhookStatus = ("queued", "processing", "error", "complete")
+TranscriptionStatus = ("pending", "available", "unavailable")

@@ -127,6 +127,14 @@ print(info["apiProjectId"], info["generationId"])
 restoration or final settlement is still pending; stage progress alone does not
 indicate overall completion.
 
+For Diffio 2.0, `complete` means restored media is ready. Transcription can still
+be `pending`, become `available` later, or finish as `unavailable`. Read
+`progress.transcription.status` independently; `progress.transcription` is `None`
+for older responses that do not report availability. A completed generation
+remains successful if transcription is unavailable. Completion webhooks expose
+the same optional `event.transcription` object; a later transcript does not emit
+another `generation.completed` event.
+
 ```py
 from diffio import DiffioClient
 
@@ -137,6 +145,8 @@ progress = client.generations.get_progress(
 )
 
 print(progress.status)
+if progress.transcription is not None:
+    print(progress.transcription.status)
 ```
 
 ## Generation download
@@ -158,15 +168,40 @@ print(download.downloadUrl)
 If you only need the URL, use `client.generations.get_download`.
 
 Set `downloadType="transcript"` to download the transcript JSON artifact when the generation has one.
+Pending transcripts return `DiffioApiError` with `statusCode == 409` and
+`responseBody["code"] == "TRANSCRIPT_PENDING"`. Unavailable transcripts return
+`statusCode == 404` and `responseBody["code"] == "TRANSCRIPT_UNAVAILABLE"`. These
+responses include `responseBody["transcription"]["status"]`. Check the error code
+to distinguish them from other 409 or 404 errors.
 
 ```py
-transcript = client.generations.download(
-    generationId="gen_123",
-    apiProjectId="proj_123",
-    downloadType="transcript",
-    downloadFilePath="word_timestamps.json",
-)
+from diffio import DiffioApiError
+
+try:
+    transcript = client.generations.download(
+        generationId="gen_123",
+        apiProjectId="proj_123",
+        downloadType="transcript",
+        downloadFilePath="word_timestamps.json",
+    )
+except DiffioApiError as exc:
+    body = exc.responseBody if isinstance(exc.responseBody, dict) else {}
+    if exc.statusCode == 409 and body.get("code") == "TRANSCRIPT_PENDING":
+        print("Transcript is pending; check progress and retry later.")
+    elif exc.statusCode == 404 and body.get("code") == "TRANSCRIPT_UNAVAILABLE":
+        print("Transcript is unavailable; restored media remains available.")
+    else:
+        raise
 ```
+
+`restore_audio(downloadType="transcript")` also makes one download request after
+media completion. It does not wait for a pending transcript. With its default
+`raiseOnError=False`, it returns `(None, info)` and preserves the API error in
+`info["statusCode"]` and `info["responseBody"]`; `info["status"]` can still be
+`complete` because media restoration succeeded. With `raiseOnError=True`, it raises
+the same `DiffioApiError` and attaches the metadata as `exc.restoreInfo`. Callers
+can poll progress and retry the transcript download explicitly. Audio and video
+downloads proceed independently of transcription availability.
 
 ## Account, keys, usage, and webhook configuration
 

@@ -449,7 +449,8 @@ def test_advertised_models_match_runtime_model_support():
     assert MODEL_ENDPOINTS["diffio-3.4"] == "diffio-3.4-generation"
 
 
-def test_restore_audio_runs_full_flow_and_downloads(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("transcription_status", [None, "pending", "available", "unavailable"])
+def test_restore_audio_runs_full_flow_and_downloads(tmp_path, monkeypatch, transcription_status):
     status_sequence = ["queued", "processing", "complete"]
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -492,6 +493,7 @@ def test_restore_audio_runs_full_flow_and_downloads(tmp_path: Path, monkeypatch)
             return httpx.Response(
                 200,
                 json={
+                    **({"transcription": {"status": transcription_status}} if transcription_status else {}),
                     "generationId": "gen_123",
                     "apiProjectId": "proj_abc",
                     "status": status,
@@ -566,6 +568,12 @@ def test_restore_audio_runs_full_flow_and_downloads(tmp_path: Path, monkeypatch)
     assert info["downloadUrl"] == "https://download.test/output.mp3"
     assert info["error"] is None
     assert info["ok"] is True
+    assert info["statusCode"] is None
+    assert info["responseBody"] is None
+    if transcription_status is None:
+        assert info["progress"].transcription is None
+    else:
+        assert info["progress"].transcription.status == transcription_status
 
 
 def test_create_generation_rejects_unknown_model():
