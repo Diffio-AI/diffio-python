@@ -141,7 +141,7 @@ jobs:
           PY
 
       - name: Test
-        run: python -m pytest tests/test_client.py
+        run: python -m pytest tests/test_client.py tests/test_transcription.py
 
       - name: Build
         if: ${{ steps.version.outputs.publish == 'true' }}
