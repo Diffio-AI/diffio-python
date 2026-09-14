@@ -449,6 +449,9 @@ class DiffioClient:
         """
         Polls generation progress until completion or failure.
 
+        For Diffio 2.0, completion means restored media is ready. The returned
+        transcription state can still be pending or unavailable.
+
         Parameters
         ----------
         generationId : str
@@ -513,12 +516,19 @@ class DiffioClient:
         apiProjectId : str
             The project id that owns the generation.
         downloadType : str, optional
-            Optional download type, audio, mp3, or video.
+            Optional download type, audio, mp3, video, or transcript.
 
         Returns
         -------
         GenerationDownloadResponse
             Signed download URL and file metadata.
+
+        Raises
+        ------
+        DiffioApiError
+            Transcript downloads return statusCode 409 with responseBody code
+            TRANSCRIPT_PENDING, or 404 with code TRANSCRIPT_UNAVAILABLE. Overall
+            generation completion does not guarantee transcript availability.
 
         Examples
         --------
@@ -906,7 +916,7 @@ class GenerationsClient:
         downloadFilePath : str
             Local file path to write the downloaded media to.
         downloadType : str, optional
-            Optional download type, audio, mp3, or video.
+            Optional download type, audio, mp3, video, or transcript.
 
         Returns
         -------
@@ -1495,6 +1505,8 @@ def _init_restore_metadata():
         "errorDetails": None,
         "exceptionType": None,
         "exceptionMessage": None,
+        "statusCode": None,
+        "responseBody": None,
     }
 
 
@@ -1502,6 +1514,9 @@ def _set_restore_error(metadata, exc):
     metadata["error"] = str(exc)
     metadata["exceptionType"] = exc.__class__.__name__
     metadata["exceptionMessage"] = str(exc)
+    if isinstance(exc, DiffioApiError):
+        metadata["statusCode"] = exc.statusCode
+        metadata["responseBody"] = exc.responseBody
 
 
 def _attach_restore_metadata(exc, metadata):
