@@ -1,4 +1,5 @@
 import json
+import math
 import mimetypes
 import os
 import tempfile
@@ -19,6 +20,9 @@ from .types import (
     CreateProjectResponse,
     DownloadType,
     GenerationDownloadResponse,
+    GenerationExportPendingResponse,
+    GenerationMixResponse,
+    GenerationPlaybackResponse,
     GenerationProgressResponse,
     GenerationWebhookEvent,
     ListProjectGenerationsResponse,
@@ -38,6 +42,7 @@ MODEL_ENDPOINTS = {
     "diffio-2-flash": "diffio-2.0-flash-generation",
     "diffio-3.4": "diffio-3.4-generation",
     "diffio-3.5": "diffio-3.5-generation",
+    "diffio-4.0": "diffio-4.0-generation",
 }
 DEFAULT_RETRY_STATUS_CODES = [408, 429, 500, 502, 503, 504]
 DEFAULT_RETRY_BACKOFF = 0.5
@@ -504,6 +509,9 @@ class DiffioClient:
         generationId,
         apiProjectId,
         downloadType=None,
+        artifact=None,
+        format=None,
+        backgroundGain=None,
         requestOptions=None,
     ):
         """
@@ -547,13 +555,62 @@ class DiffioClient:
             resolved_download_type, _ = _normalize_download_type(downloadType)
             payload["downloadType"] = resolved_download_type
 
+        if artifact is not None:
+            if artifact not in ("mix", "speech", "background"):
+                raise ValueError("artifact must be mix, speech, or background")
+            payload["artifact"] = artifact
+        if format is not None:
+            if format not in ("mp3", "flac", "mp4"):
+                raise ValueError("format must be mp3, flac, or mp4")
+            payload["format"] = format
+        if backgroundGain is not None:
+            _validate_background_gain(backgroundGain)
+            payload["backgroundGain"] = backgroundGain
+
         response = self._request(
             "POST",
             "get_generation_download",
             json_payload=payload,
             requestOptions=requestOptions,
         )
+        if isinstance(response, dict) and response.get("status") == "pending":
+            try:
+                return GenerationExportPendingResponse.from_dict(response)
+            except (KeyError, ValueError, TypeError) as exc:
+                raise DiffioApiError("Malformed pending export response", responseBody=response) from exc
         return GenerationDownloadResponse.from_dict(response)
+
+    def update_generation_mix(
+        self, *, apiProjectId, generationId, backgroundGain, expectedRevision,
+        requestOptions=None,
+    ):
+        _validate_background_gain(backgroundGain)
+        if isinstance(expectedRevision, bool) or not isinstance(expectedRevision, int) or expectedRevision < 0:
+            raise ValueError("expectedRevision must be a nonnegative integer")
+        response = self._request(
+            "POST", "update_generation_mix",
+            json_payload={
+                "apiProjectId": apiProjectId, "generationId": generationId,
+                "backgroundGain": backgroundGain, "expectedRevision": expectedRevision,
+            },
+            requestOptions=requestOptions, allow_retries=False,
+        )
+        return GenerationMixResponse.from_dict(response)
+
+    def get_generation_playback(
+        self, *, apiProjectId, generationId, startChunk=0, chunkCount=8, requestOptions=None,
+    ):
+        if isinstance(startChunk, bool) or not isinstance(startChunk, int) or startChunk < 0:
+            raise ValueError("startChunk must be a nonnegative integer")
+        if isinstance(chunkCount, bool) or not isinstance(chunkCount, int) or not 1 <= chunkCount <= 16:
+            raise ValueError("chunkCount must be an integer between 1 and 16")
+        response = self._request(
+            "POST", "get_generation_playback",
+            json_payload={"apiProjectId": apiProjectId, "generationId": generationId,
+                          "startChunk": startChunk, "chunkCount": chunkCount},
+            requestOptions=requestOptions,
+        )
+        return GenerationPlaybackResponse.from_dict(response)
 
     def send_webhook_test_event(
         self,
@@ -797,7 +854,11 @@ class DiffioClient:
                 attempt += 1
                 continue
 
-            return _raise_for_error(response)
+            data = _raise_for_error(response)
+            if path == "get_generation_download" and response.status_code == 202:
+                if not isinstance(data, dict) or data.get("status") != "pending":
+                    raise DiffioApiError("Malformed pending export response", statusCode=202, responseBody=data)
+            return data
 
 
 class AccountClient:
@@ -886,12 +947,16 @@ class GenerationsClient:
         generationId,
         apiProjectId,
         downloadType=None,
+        artifact=None,
+        format=None,
+        backgroundGain=None,
         requestOptions=None,
     ):
         return self._parent.get_generation_download(
             generationId=generationId,
             apiProjectId=apiProjectId,
             downloadType=downloadType,
+            artifact=artifact, format=format, backgroundGain=backgroundGain,
             requestOptions=requestOptions,
         )
 
@@ -901,7 +966,11 @@ class GenerationsClient:
         generationId,
         apiProjectId,
         downloadFilePath,
+        exportTimeout=600.0,
         downloadType=None,
+        artifact=None,
+        format=None,
+        backgroundGain=None,
         requestOptions=None,
     ):
         """
@@ -931,15 +1000,60 @@ class GenerationsClient:
         else:
             resolved_download_type = None
 
-        download = self._parent.get_generation_download(
+        download = self.wait_for_download(
             generationId=generationId,
             apiProjectId=apiProjectId,
             downloadType=resolved_download_type,
+            artifact=artifact, format=format, backgroundGain=backgroundGain,
+            timeout=exportTimeout,
             requestOptions=requestOptions,
         )
         _warn_download_extension_mismatch(download, resolved_path)
         _download_to_file(self._parent, download.downloadUrl, resolved_path, requestOptions=requestOptions)
         return download
+
+    def wait_for_download(
+        self, *, generationId, apiProjectId, downloadType=None, artifact=None,
+        format=None, backgroundGain=None, timeout=600.0, requestOptions=None,
+    ):
+        """Poll an idempotent export request until ready, or raise TimeoutError."""
+        if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("timeout must be finite and positive")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            options = _merge_request_options(self._parent._default_request_options, requestOptions or {})
+            options.maxRetries = 0
+            if options.timeout is None:
+                options.timeout = remaining
+            elif isinstance(options.timeout, (int, float)):
+                options.timeout = min(options.timeout, remaining)
+            download = self.get_download(
+                generationId=generationId, apiProjectId=apiProjectId,
+                downloadType=downloadType, artifact=artifact, format=format,
+                backgroundGain=backgroundGain, requestOptions=options,
+            )
+            if not isinstance(download, GenerationExportPendingResponse):
+                return download
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(max(0.1, download.retryAfterSeconds), remaining))
+        raise TimeoutError("Timed out waiting for generation export")
+
+    def update_mix(self, *, apiProjectId, generationId, backgroundGain, expectedRevision, requestOptions=None):
+        return self._parent.update_generation_mix(
+            apiProjectId=apiProjectId, generationId=generationId,
+            backgroundGain=backgroundGain, expectedRevision=expectedRevision,
+            requestOptions=requestOptions,
+        )
+
+    def get_playback(self, *, apiProjectId, generationId, startChunk=0, chunkCount=8, requestOptions=None):
+        return self._parent.get_generation_playback(
+            apiProjectId=apiProjectId, generationId=generationId,
+            startChunk=startChunk, chunkCount=chunkCount, requestOptions=requestOptions,
+        )
 
     def wait_for_complete(
         self,
@@ -1231,7 +1345,8 @@ class AudioIsolationClient:
 
         metadata["stage"] = "download_info"
         try:
-            download = self._parent.get_generation_download(
+            download = self._parent.generations.wait_for_download(
+                timeout=timeout,
                 generationId=result.generation.generationId,
                 apiProjectId=result.project.apiProjectId,
                 downloadType=downloadType,
@@ -1672,3 +1787,8 @@ def _report_progress(progress, *, onProgress, showProgress):
         onProgress(progress)
     if showProgress:
         print(_format_progress(progress))
+
+
+def _validate_background_gain(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+        raise ValueError("backgroundGain must be a finite number between 0 and 1")

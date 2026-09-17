@@ -1,3 +1,5 @@
+import math
+
 class CreateProjectResponse:
     def __init__(
         self,
@@ -451,7 +453,7 @@ class AudioIsolationResult:
         self.generation = generation
 
 
-ModelKey = ("diffio-2", "diffio-2-flash", "diffio-3.4", "diffio-3.5")
+ModelKey = ("diffio-2", "diffio-2-flash", "diffio-3.4", "diffio-3.5", "diffio-4.0")
 DownloadType = ("audio", "mp3", "video", "transcript")
 WebhookMode = ("test", "live")
 WebhookEventType = (
@@ -462,3 +464,47 @@ WebhookEventType = (
 )
 GenerationWebhookStatus = ("queued", "processing", "error", "complete")
 TranscriptionStatus = ("pending", "available", "unavailable")
+
+
+class GenerationExportPendingResponse:
+    def __init__(self, exportId, retryAfterSeconds=2):
+        if not isinstance(exportId, str) or not exportId.strip():
+            raise ValueError("exportId must be a nonempty string")
+        if (isinstance(retryAfterSeconds, bool) or not isinstance(retryAfterSeconds, (int, float))
+                or not math.isfinite(retryAfterSeconds) or retryAfterSeconds < 0):
+            raise ValueError("retryAfterSeconds must be finite and nonnegative")
+        self.status = "pending"
+        self.exportId = exportId
+        self.retryAfterSeconds = retryAfterSeconds
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(data["exportId"], data.get("retryAfterSeconds", 2))
+
+
+class GenerationMix:
+    def __init__(self, backgroundGain, revision):
+        self.backgroundGain = backgroundGain
+        self.revision = revision
+
+
+class GenerationMixResponse:
+    def __init__(self, generationId, mix):
+        self.generationId = generationId
+        self.mix = mix
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(data["generationId"], GenerationMix(
+            data["mix"]["backgroundGain"], data["mix"]["revision"],
+        ))
+
+
+class GenerationPlaybackResponse:
+    def __init__(self, generationId, manifest):
+        self.generationId = generationId
+        self.manifest = manifest
+
+    @classmethod
+    def from_dict(cls, data):
+        return cls(data["generationId"], data["manifest"])
