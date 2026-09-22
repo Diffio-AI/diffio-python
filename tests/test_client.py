@@ -311,6 +311,82 @@ def test_create_generation_routes_to_diffio_3_5_endpoint():
     assert response.modelKey == "diffio-3.5"
 
 
+def _create_generation_idempotency_handler(received):
+    def handler(request: httpx.Request) -> httpx.Response:
+        received["path"] = request.url.path
+        received["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={
+                "generationId": "gen_1",
+                "apiProjectId": "proj",
+                "modelKey": "diffio-2",
+                "status": "queued",
+            },
+        )
+
+    return handler
+
+
+def test_create_generation_sends_idempotency_key():
+    received = {}
+    transport = httpx.MockTransport(_create_generation_idempotency_handler(received))
+    http_client = httpx.Client(base_url="https://api.test", transport=transport)
+    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
+
+    response = client.create_generation(apiProjectId="proj", idempotencyKey="retry-1")
+
+    assert received["payload"]["apiProjectId"] == "proj"
+    assert received["payload"]["idempotencyKey"] == "retry-1"
+    assert response.generationId == "gen_1"
+    assert response.idempotentReplay is False
+
+
+def test_create_generation_omits_idempotency_key_when_not_provided():
+    received = {}
+    transport = httpx.MockTransport(_create_generation_idempotency_handler(received))
+    http_client = httpx.Client(base_url="https://api.test", transport=transport)
+    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
+
+    client.create_generation(apiProjectId="proj")
+
+    assert "idempotencyKey" not in received["payload"]
+
+
+def test_generations_resource_create_passes_idempotency_key():
+    received = {}
+    transport = httpx.MockTransport(_create_generation_idempotency_handler(received))
+    http_client = httpx.Client(base_url="https://api.test", transport=transport)
+    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
+
+    client.generations.create(apiProjectId="proj", idempotencyKey="retry-9")
+
+    assert received["payload"]["idempotencyKey"] == "retry-9"
+
+
+def test_create_generation_parses_idempotent_replay_flag():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "generationId": "gen_1",
+                "apiProjectId": "proj",
+                "modelKey": "diffio-2",
+                "status": "processing",
+                "idempotentReplay": True,
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    http_client = httpx.Client(base_url="https://api.test", transport=transport)
+    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
+
+    response = client.create_generation(apiProjectId="proj", idempotencyKey="retry-1")
+
+    assert response.idempotentReplay is True
+    assert response.status == "processing"
+
+
 def test_restore_audio_runs_full_flow_and_downloads(tmp_path: Path, monkeypatch):
     status_sequence = ["queued", "processing", "complete"]
 

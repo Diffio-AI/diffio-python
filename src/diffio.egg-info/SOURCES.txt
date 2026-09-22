@@ -1,0 +1,15 @@
+LICENSE
+README.md
+pyproject.toml
+src/diffio/__init__.py
+src/diffio/client.py
+src/diffio/errors.py
+src/diffio/testing.py
+src/diffio/types.py
+src/diffio.egg-info/PKG-INFO
+src/diffio.egg-info/SOURCES.txt
+src/diffio.egg-info/dependency_links.txt
+src/diffio.egg-info/requires.txt
+src/diffio.egg-info/top_level.txt
+tests/test_client.py
+tests/test_emulator_e2e.py

@@ -309,6 +309,7 @@ class DiffioClient:
         model="diffio-2",
         sampling=None,
         params=None,
+        idempotencyKey=None,
         requestOptions=None,
     ):
         endpoint = MODEL_ENDPOINTS.get(model)
@@ -320,6 +321,8 @@ class DiffioClient:
             payload["sampling"] = sampling
         if params:
             payload["params"] = params
+        if idempotencyKey is not None:
+            payload["idempotencyKey"] = idempotencyKey
 
         response = self._request("POST", endpoint, json_payload=payload, requestOptions=requestOptions)
         return CreateGenerationResponse.from_dict(response)
@@ -833,6 +836,7 @@ class GenerationsClient:
         model="diffio-2",
         sampling=None,
         params=None,
+        idempotencyKey=None,
         requestOptions=None,
     ):
         return self._parent.create_generation(
@@ -840,6 +844,7 @@ class GenerationsClient:
             model=model,
             sampling=sampling,
             params=params,
+            idempotencyKey=idempotencyKey,
             requestOptions=requestOptions,
         )
 
@@ -945,6 +950,7 @@ class GenerationsClient:
         model="diffio-2",
         sampling=None,
         params=None,
+        idempotencyKey=None,
         pollInterval=2.0,
         timeout=600.0,
         onProgress=None,
@@ -958,6 +964,7 @@ class GenerationsClient:
             model=model,
             sampling=sampling,
             params=params,
+            idempotencyKey=idempotencyKey,
             requestOptions=requestOptions,
         )
         progress = self.wait_for_complete(

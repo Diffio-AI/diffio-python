@@ -1,3 +1,31 @@
+Metadata-Version: 2.4
+Name: diffio
+Version: 0.1.7
+Summary: Python SDK for the Diffio API.
+Author: Diffio
+License: MIT
+Project-URL: Homepage, https://diffio.ai
+Project-URL: Repository, https://github.com/Diffio-AI/diffio-python
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3 :: Only
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: httpx>=0.24.0
+Requires-Dist: svix<2.0.0,>=1.84.1
+Provides-Extra: dev
+Requires-Dist: build>=1.0; extra == "dev"
+Requires-Dist: pytest>=7.4; extra == "dev"
+Requires-Dist: twine>=5.0; extra == "dev"
+Dynamic: license-file
+
 # Diffio Python SDK
 
 The Diffio Python SDK helps you call the Diffio API from Python. This version covers project creation, upload, generation, progress checks, and download URLs.
