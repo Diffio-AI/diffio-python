@@ -67,7 +67,7 @@ project = client.create_project(
 
 generation = client.create_generation(
     apiProjectId=project.apiProjectId,
-    model="diffio-3.5",
+    model="diffio-4.0-flash",
     sampling={"steps": 12, "guidance": 1.5},
     idempotencyKey="restore-job-2026-001",
     requestOptions={"maxRetries": 2},
@@ -89,7 +89,7 @@ from diffio import DiffioClient
 client = DiffioClient(apiKey="diffio_live_...")
 result = client.audio_isolation.isolate(
     filePath="sample.wav",
-    model="diffio-3.5",
+    model="diffio-4.0-flash",
     sampling={"steps": 12, "guidance": 1.5},
 )
 
@@ -106,7 +106,7 @@ from diffio import DiffioClient
 client = DiffioClient(apiKey="diffio_live_...")
 audio_bytes, info = client.restore_audio(
     filePath="sample.wav",
-    model="diffio-3.5",
+    model="diffio-4.0-flash",
     sampling={"steps": 12, "guidance": 1.5},
     onProgress=lambda progress: print(progress.status),
 )
