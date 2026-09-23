@@ -248,7 +248,7 @@ def test_audio_isolation_isolate_runs_full_flow(tmp_path: Path):
             assert request.headers.get("Content-Type") == "audio/wav"
             return httpx.Response(200)
 
-        if request.url.path == "/v1/diffio-2.0-generation":
+        if request.url.path in ("/v1/diffio-2.0-generation", "/v1/diffio-4.0-flash-generation"):
             payload = json.loads(request.content.decode("utf-8"))
             assert payload["apiProjectId"] == "proj_abc"
             assert payload["sampling"]["steps"] == 10
@@ -257,7 +257,7 @@ def test_audio_isolation_isolate_runs_full_flow(tmp_path: Path):
                 json={
                     "generationId": "gen_123",
                     "apiProjectId": "proj_abc",
-                    "modelKey": "diffio-2",
+                    "modelKey": "diffio-4.0-flash" if "4.0-flash" in request.url.path else "diffio-2",
                     "status": "queued",
                 },
             )
@@ -326,7 +326,7 @@ def test_create_generation_sends_idempotency_key_and_parses_replay():
             json={
                 "generationId": "gen_original",
                 "apiProjectId": "proj_123",
-                "modelKey": "diffio-2",
+                "modelKey": "diffio-4.0-flash" if "4.0-flash" in request.url.path else "diffio-2",
                 "status": "queued",
                 "idempotentReplay": True,
             },
@@ -341,7 +341,7 @@ def test_create_generation_sends_idempotency_key_and_parses_replay():
         idempotencyKey="restore-job-2026-001",
     )
 
-    assert received["path"] == "/v1/diffio-2.0-generation"
+    assert received["path"] == "/v1/diffio-4.0-flash-generation"
     assert received["payload"] == {
         "apiProjectId": "proj_123",
         "idempotencyKey": "restore-job-2026-001",
@@ -360,7 +360,7 @@ def test_generations_create_forwards_idempotency_key():
             json={
                 "generationId": "gen_123",
                 "apiProjectId": "proj_123",
-                "modelKey": "diffio-2",
+                "modelKey": "diffio-4.0-flash" if "4.0-flash" in request.url.path else "diffio-2",
                 "status": "queued",
             },
         )
@@ -382,14 +382,14 @@ def test_generations_create_and_wait_forwards_idempotency_key():
     received = {}
 
     def handler(request):
-        if request.url.path == "/v1/diffio-2.0-generation":
+        if request.url.path in ("/v1/diffio-2.0-generation", "/v1/diffio-4.0-flash-generation"):
             received["createPayload"] = json.loads(request.content.decode("utf-8"))
             return httpx.Response(
                 200,
                 json={
                     "generationId": "gen_123",
                     "apiProjectId": "proj_123",
-                    "modelKey": "diffio-2",
+                    "modelKey": "diffio-4.0-flash" if "4.0-flash" in request.url.path else "diffio-2",
                     "status": "queued",
                     "idempotentReplay": False,
                 },
@@ -474,7 +474,7 @@ def test_restore_audio_runs_full_flow_and_downloads(tmp_path, monkeypatch, trans
             assert request.headers.get("Content-Type") == "audio/wav"
             return httpx.Response(200)
 
-        if request.url.path == "/v1/diffio-2.0-generation":
+        if request.url.path in ("/v1/diffio-2.0-generation", "/v1/diffio-4.0-flash-generation"):
             payload = json.loads(request.content.decode("utf-8"))
             assert payload["apiProjectId"] == "proj_abc"
             assert payload["sampling"]["steps"] == 10
@@ -483,7 +483,7 @@ def test_restore_audio_runs_full_flow_and_downloads(tmp_path, monkeypatch, trans
                 json={
                     "generationId": "gen_123",
                     "apiProjectId": "proj_abc",
-                    "modelKey": "diffio-2",
+                    "modelKey": "diffio-4.0-flash" if "4.0-flash" in request.url.path else "diffio-2",
                     "status": "queued",
                 },
             )
@@ -861,7 +861,7 @@ def test_list_project_generations_payload_and_response():
                     {
                         "generationId": "gen_123",
                         "status": "processing",
-                        "modelKey": "diffio-2",
+                        "modelKey": "diffio-4.0-flash" if "4.0-flash" in request.url.path else "diffio-2",
                         "progress": None,
                         "createdAt": "2026-01-05T12:40:00Z",
                         "updatedAt": "2026-01-05T12:41:00Z",
