@@ -110,6 +110,49 @@ def test_request_options_override_headers_and_api_key():
     assert received["custom"] == "present"
 
 
+def test_requests_identify_the_python_sdk():
+    import diffio
+
+    received = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received.append(request.headers)
+        return httpx.Response(200, json={"projects": []})
+
+    http_client = httpx.Client(base_url="https://api.test", transport=httpx.MockTransport(handler))
+    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
+
+    client.list_projects()
+    client.list_projects(requestOptions={"headers": {"X-Test": "present"}})
+
+    for headers in received:
+        assert headers["User-Agent"] == f"diffio-python/{diffio.__version__}"
+        assert headers["X-Diffio-SDK-Language"] == "Python"
+        assert headers["X-Diffio-SDK-Name"] == "diffio"
+        assert headers["X-Diffio-SDK-Version"] == diffio.__version__
+    assert received[1]["X-Test"] == "present"
+
+
+def test_request_options_can_override_the_user_agent():
+    received = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received["userAgent"] = request.headers.get("User-Agent")
+        return httpx.Response(200, json={"projects": []})
+
+    http_client = httpx.Client(base_url="https://api.test", transport=httpx.MockTransport(handler))
+    client = DiffioClient(
+        apiKey="diffio_live_test",
+        baseUrl="https://api.test",
+        httpClient=http_client,
+        requestOptions={"headers": {"User-Agent": "my-app/1.0"}},
+    )
+
+    client.list_projects()
+
+    assert received["userAgent"] == "my-app/1.0"
+
+
 def test_request_options_retries_on_status():
     calls = {"count": 0}
 

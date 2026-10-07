@@ -138,9 +138,21 @@ def _extract_svix_headers(headers):
     }
 
 
+def sdk_identity_headers():
+    """Headers that identify this SDK and its version to the Diffio API, matching the JavaScript SDK's."""
+    from . import __version__
+
+    return {
+        "User-Agent": f"diffio-python/{__version__}",
+        "X-Diffio-SDK-Language": "Python",
+        "X-Diffio-SDK-Name": "diffio",
+        "X-Diffio-SDK-Version": __version__,
+    }
+
+
 def _default_request_options():
     return RequestOptions(
-        headers={},
+        headers=sdk_identity_headers(),
         timeout=None,
         maxRetries=0,
         retryBackoff=DEFAULT_RETRY_BACKOFF,
