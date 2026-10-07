@@ -15,6 +15,7 @@ from .types import (
     ApiKeyResponse,
     ApiKeysListResponse,
     AudioIsolationResult,
+    CompleteProjectUploadResponse,
     CreateGenerationResponse,
     CreateProjectResponse,
     DownloadType,
@@ -33,14 +34,13 @@ from .types import (
 
 DEFAULT_BASE_URL = "https://api.diffio.ai"
 API_PREFIX = "v1"
+# Generation endpoint per model; the API answers every other model id with HTTP 410 model_retired.
 MODEL_ENDPOINTS = {
-    "diffio-2": "diffio-2.0-generation",
-    "diffio-2-flash": "diffio-2.0-flash-generation",
-    "diffio-3.4": "diffio-3.4-generation",
-    "diffio-3.5": "diffio-3.5-generation",
-    "diffio-4.0-flash": "diffio-4.0-flash-generation",
-    "diffio-4.0-pro": "diffio-4.0-pro-generation",
+    "diffio-4.5-flash": "diffio-4.5-flash-generation",
+    "diffio-4.5-pro": "diffio-4.5-pro-generation",
 }
+# Diffio 4.5 Flash is available on every plan; Diffio 4.5 Pro needs a paid plan.
+DEFAULT_MODEL_KEY = "diffio-4.5-flash"
 DEFAULT_RETRY_STATUS_CODES = [408, 429, 500, 502, 503, 504]
 DEFAULT_RETRY_BACKOFF = 0.5
 
@@ -208,6 +208,19 @@ class DiffioClient:
         fileFormat=None,
         requestOptions=None,
     ):
+        """
+        Creates a project, uploads the file, and confirms the upload.
+
+        The file goes to the Diffio upload API in parts of the session's
+        partSizeBytes (32 MiB), authorized by the session's upload token. With
+        maxRetries set, a failed part is retried on its own. After the upload,
+        create_project calls complete_project_upload so preprocessing starts.
+
+        Returns
+        -------
+        CreateProjectResponse
+            The project id, its upload session, and uploadCompletion.
+        """
         payload = _build_create_project_payload(
             filePath=filePath,
             contentType=contentType,
@@ -218,75 +231,163 @@ class DiffioClient:
 
         response = self._request("POST", "create_project", json_payload=payload, requestOptions=requestOptions)
         project = CreateProjectResponse.from_dict(response)
-        self._upload_file(
-            uploadUrl=project.uploadUrl,
-            uploadMethod=project.uploadMethod,
-            filePath=filePath,
-            contentType=payload["contentType"],
+        self._upload_project_file_to_edge(
+            upload=project.upload,
+            filePath=os.fspath(filePath),
+            requestOptions=requestOptions,
+        )
+        project.uploadCompletion = self.complete_project_upload(
+            apiProjectId=project.apiProjectId,
             requestOptions=requestOptions,
         )
         return project
 
-    def _upload_file(
-        self,
-        *,
-        uploadUrl,
-        uploadMethod=None,
-        filePath=None,
-        data=None,
-        contentType=None,
-        requestOptions=None,
-    ):
-        if (filePath is None) == (data is None):
-            raise ValueError("Provide filePath or data")
+    def complete_project_upload(self, *, apiProjectId, requestOptions=None):
+        """
+        Confirms that a project's upload landed so preprocessing starts.
 
-        resolved_content_type = contentType
-        if resolved_content_type is None and filePath is not None:
-            resolved_content_type = _guess_content_type(filePath)
-        if resolved_content_type is None:
-            resolved_content_type = "application/octet-stream"
+        create_project calls this after its upload. It is idempotent, so it is
+        safe to call again for a project whose upload already finished.
 
-        method = (uploadMethod or "PUT").upper()
+        Returns
+        -------
+        CompleteProjectUploadResponse
+            The project id, upload status, and stored size in bytes.
+        """
+        if not apiProjectId:
+            raise ValueError("apiProjectId is required")
+        response = self._request(
+            "POST",
+            "complete_project_upload",
+            json_payload={"apiProjectId": apiProjectId},
+            requestOptions=requestOptions,
+        )
+        return CompleteProjectUploadResponse.from_dict(response)
+
+    def _upload_project_file_to_edge(self, *, upload, filePath, requestOptions=None):
+        """Sends a file through the edge multipart upload API (start, parts, complete) with the session token.
+
+        Each part is retried on its own under the request options' retry policy. Any failure after
+        start aborts the multipart upload before the error is raised.
+        """
         merged_options = _merge_request_options(self._default_request_options, requestOptions)
-        headers = {"Content-Type": resolved_content_type}
-        if _is_storage_emulator_url(uploadUrl):
-            headers["Authorization"] = "Bearer owner"
-        headers = _merge_headers(headers, merged_options.headers)
-        timeout = merged_options.timeout
-        max_retries = merged_options.maxRetries if merged_options.maxRetries is not None else 0
+        size_bytes = os.path.getsize(filePath)
+        if size_bytes > upload.maxBytes:
+            raise ValueError(
+                f"{filePath} is {size_bytes} bytes; the upload limit is {upload.maxBytes} bytes"
+            )
+
+        started = self._send_edge_upload_request(
+            upload,
+            "POST",
+            "start",
+            content=b"{}",
+            contentType="application/json",
+            mergedOptions=merged_options,
+        )
+        upload_id = started.get("uploadId")
+        if not isinstance(upload_id, str) or not upload_id:
+            raise DiffioApiError("The edge upload start response has no uploadId", responseBody=started)
+        part_size_bytes = started.get("partSizeBytes")
+        if not isinstance(part_size_bytes, int) or isinstance(part_size_bytes, bool) or part_size_bytes <= 0:
+            part_size_bytes = upload.partSizeBytes
+
+        try:
+            receipts = []
+            with open(filePath, "rb") as handle:
+                for part_number, start_byte, end_byte in _plan_edge_upload_parts(size_bytes, part_size_bytes):
+                    handle.seek(start_byte)
+                    part_bytes = handle.read(end_byte - start_byte)
+                    if len(part_bytes) != end_byte - start_byte:
+                        raise ValueError(f"{filePath} changed size during the upload")
+                    receipt = self._send_edge_upload_request(
+                        upload,
+                        "PUT",
+                        f"parts/{part_number}",
+                        params={"uploadId": upload_id},
+                        content=part_bytes,
+                        contentType="application/octet-stream",
+                        mergedOptions=merged_options,
+                    )
+                    etag = receipt.get("etag")
+                    if not isinstance(etag, str) or not etag:
+                        raise DiffioApiError(
+                            f"The edge upload part {part_number} response has no etag",
+                            responseBody=receipt,
+                        )
+                    receipts.append({"partNumber": part_number, "etag": etag})
+            self._send_edge_upload_request(
+                upload,
+                "POST",
+                "complete",
+                content=json.dumps({"uploadId": upload_id, "parts": receipts}).encode("utf-8"),
+                contentType="application/json",
+                mergedOptions=merged_options,
+            )
+        except Exception:
+            # Release the partial multipart upload; a failed abort never hides the upload error.
+            try:
+                self._send_edge_upload_request(
+                    upload,
+                    "POST",
+                    "abort",
+                    content=json.dumps({"uploadId": upload_id}).encode("utf-8"),
+                    contentType="application/json",
+                    mergedOptions=merged_options,
+                    allowRetries=False,
+                )
+            except Exception:
+                pass
+            raise
+
+    def _send_edge_upload_request(
+        self,
+        upload,
+        method,
+        action,
+        *,
+        content,
+        contentType,
+        mergedOptions,
+        params=None,
+        allowRetries=True,
+    ):
+        url = f"{upload.edgeBaseUrl}/v1/uploads/{action}"
+        # The upload token is the only credential the edge accepts; the API key never leaves the API host.
+        headers = {
+            key: value
+            for key, value in (mergedOptions.headers or {}).items()
+            if str(key).lower() not in {"authorization", "content-type", "content-length"}
+        }
+        headers["Content-Type"] = contentType
+        headers["Authorization"] = f"Bearer {upload.uploadToken}"
+        timeout = mergedOptions.timeout
+        max_retries = mergedOptions.maxRetries if mergedOptions.maxRetries is not None else 0
+        if not allowRetries:
+            max_retries = 0
         retry_backoff = (
-            merged_options.retryBackoff if merged_options.retryBackoff is not None else DEFAULT_RETRY_BACKOFF
+            mergedOptions.retryBackoff if mergedOptions.retryBackoff is not None else DEFAULT_RETRY_BACKOFF
         )
         retry_statuses = (
-            merged_options.retryStatusCodes
-            if merged_options.retryStatusCodes is not None
+            mergedOptions.retryStatusCodes
+            if mergedOptions.retryStatusCodes is not None
             else DEFAULT_RETRY_STATUS_CODES
         )
 
         attempt = 0
         while True:
             try:
-                if filePath is not None:
-                    with open(filePath, "rb") as handle:
-                        request_kwargs = {
-                            "method": method,
-                            "url": uploadUrl,
-                            "headers": headers,
-                            "content": handle,
-                        }
-                        if timeout is not None:
-                            request_kwargs["timeout"] = timeout
-                        response = self._client.request(**request_kwargs)
-                else:
-                    request_kwargs = {
-                        "method": method,
-                        "url": uploadUrl,
-                        "headers": headers,
-                        "content": data,
-                    }
-                    if timeout is not None:
-                        request_kwargs["timeout"] = timeout
-                    response = self._client.request(**request_kwargs)
+                request_kwargs = {
+                    "method": method,
+                    "url": url,
+                    "headers": headers,
+                    "content": content,
+                }
+                if params:
+                    request_kwargs["params"] = params
+                if timeout is not None:
+                    request_kwargs["timeout"] = timeout
+                response = self._client.request(**request_kwargs)
             except httpx.RequestError:
                 if attempt >= max_retries:
                     raise
@@ -300,14 +401,13 @@ class DiffioClient:
                 attempt += 1
                 continue
 
-            _raise_for_error(response)
-            return
+            return _raise_for_error(response)
 
     def create_generation(
         self,
         *,
         apiProjectId,
-        model="diffio-4.0-flash",
+        model=DEFAULT_MODEL_KEY,
         sampling=None,
         params=None,
         idempotencyKey=None,
@@ -316,7 +416,10 @@ class DiffioClient:
         """Create a generation; automatic retries require a supplied idempotency key."""
         endpoint = MODEL_ENDPOINTS.get(model)
         if not endpoint:
-            raise ValueError(f"Unsupported model: {model}")
+            raise ValueError(
+                f"Unsupported model: {model}. Diffio 4.5 Flash and Diffio 4.5 Pro are the only models;"
+                " use diffio-4.5-flash or diffio-4.5-pro."
+            )
 
         payload = {"apiProjectId": apiProjectId}
         if sampling is not None:
@@ -451,8 +554,9 @@ class DiffioClient:
         """
         Polls generation progress until completion or failure.
 
-        For Diffio 2.0, completion means restored media is ready. The returned
-        transcription state can still be pending or unavailable.
+        Completion means restored media is ready. Diffio 4.5 transcribes the
+        recording before restoration; read progress.transcription for the
+        transcript state while a generation runs.
 
         Parameters
         ----------
@@ -509,7 +613,7 @@ class DiffioClient:
         requestOptions=None,
     ):
         """
-        Gets a signed download URL for a generation.
+        Gets a download URL for a generation. The URL is valid for 6 hours.
 
         Parameters
         ----------
@@ -523,7 +627,7 @@ class DiffioClient:
         Returns
         -------
         GenerationDownloadResponse
-            Signed download URL and file metadata.
+            Download URL and file metadata.
 
         Raises
         ------
@@ -719,7 +823,7 @@ class DiffioClient:
         contentType=None,
         contentLength=None,
         fileFormat=None,
-        model="diffio-4.0-flash",
+        model=DEFAULT_MODEL_KEY,
         sampling=None,
         projectParams=None,
         generationParams=None,
@@ -854,7 +958,7 @@ class GenerationsClient:
         self,
         *,
         apiProjectId,
-        model="diffio-4.0-flash",
+        model=DEFAULT_MODEL_KEY,
         sampling=None,
         params=None,
         idempotencyKey=None,
@@ -968,7 +1072,7 @@ class GenerationsClient:
         self,
         *,
         apiProjectId,
-        model="diffio-4.0-flash",
+        model=DEFAULT_MODEL_KEY,
         sampling=None,
         params=None,
         idempotencyKey=None,
@@ -1006,6 +1110,12 @@ class ProjectsClient:
 
     def list(self, *, requestOptions=None):
         return self._parent.list_projects(requestOptions=requestOptions)
+
+    def complete_upload(self, *, apiProjectId, requestOptions=None):
+        return self._parent.complete_project_upload(
+            apiProjectId=apiProjectId,
+            requestOptions=requestOptions,
+        )
 
     def list_generations(
         self,
@@ -1092,7 +1202,7 @@ class AudioIsolationClient:
         contentType=None,
         contentLength=None,
         fileFormat=None,
-        model="diffio-4.0-flash",
+        model=DEFAULT_MODEL_KEY,
         sampling=None,
         projectParams=None,
         generationParams=None,
@@ -1117,7 +1227,7 @@ class AudioIsolationClient:
         contentType=None,
         contentLength=None,
         fileFormat=None,
-        model="diffio-4.0-flash",
+        model=DEFAULT_MODEL_KEY,
         sampling=None,
         projectParams=None,
         generationParams=None,
@@ -1149,7 +1259,7 @@ class AudioIsolationClient:
         contentType=None,
         contentLength=None,
         fileFormat=None,
-        model="diffio-4.0-flash",
+        model=DEFAULT_MODEL_KEY,
         sampling=None,
         projectParams=None,
         generationParams=None,
@@ -1273,7 +1383,7 @@ class AudioIsolationClient:
         contentType=None,
         contentLength=None,
         fileFormat=None,
-        model="diffio-4.0-flash",
+        model=DEFAULT_MODEL_KEY,
         sampling=None,
         projectParams=None,
         generationParams=None,
@@ -1349,6 +1459,16 @@ def _build_create_project_payload(
         payload["fileFormat"] = fileFormat
 
     return payload
+
+
+def _plan_edge_upload_parts(size_bytes, part_size_bytes):
+    """Return (partNumber, startByte, endByte) per part, numbered from 1; an empty file is one empty part."""
+    if size_bytes == 0:
+        return [(1, 0, 0)]
+    parts = []
+    for index, start_byte in enumerate(range(0, size_bytes, part_size_bytes)):
+        parts.append((index + 1, start_byte, min(size_bytes, start_byte + part_size_bytes)))
+    return parts
 
 
 def _normalize_download_type(download_type):
@@ -1478,8 +1598,12 @@ def _raise_for_error(response):
     try:
         if response.content:
             body = response.json()
-            if isinstance(body, dict) and body.get("error"):
-                message = str(body.get("error"))
+            error = body.get("error") if isinstance(body, dict) else None
+            # The API answers {"error": "message"}; the edge Worker answers {"error": {"code", "message"}}.
+            if isinstance(error, dict):
+                message = str(error.get("message") or error.get("code") or message)
+            elif error:
+                message = str(error)
         else:
             body = None
     except json.JSONDecodeError:

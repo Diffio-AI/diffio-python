@@ -34,8 +34,9 @@ def parse_args():
     parser.add_argument(
         "--model",
         dest="model",
-        default="diffio-3.5",
-        help="Model key. Defaults to diffio-3.5.",
+        default="diffio-4.5-flash",
+        choices=["diffio-4.5-flash", "diffio-4.5-pro"],
+        help="Model key, diffio-4.5-flash or diffio-4.5-pro. Defaults to diffio-4.5-flash.",
     )
     parser.add_argument(
         "--poll-interval",

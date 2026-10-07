@@ -15,6 +15,7 @@ from .types import (
     ApiKeyResponse,
     ApiKeysListResponse,
     AudioIsolationResult,
+    CompleteProjectUploadResponse,
     CreateGenerationResponse,
     CreateProjectResponse,
     DownloadType,
@@ -29,6 +30,7 @@ from .types import (
     ModelKey,
     ProjectGenerationSummary,
     ProjectSummary,
+    ProjectUploadSession,
     TranscriptionStatus,
     UsageSummaryResponse,
     WebhookConfigureResponse,
@@ -45,6 +47,7 @@ __all__ = [
     "ApiKeysListResponse",
     "AudioIsolationClient",
     "AudioIsolationResult",
+    "CompleteProjectUploadResponse",
     "CreateGenerationResponse",
     "CreateProjectResponse",
     "DownloadType",
@@ -62,6 +65,7 @@ __all__ = [
     "ModelKey",
     "ProjectGenerationSummary",
     "ProjectSummary",
+    "ProjectUploadSession",
     "ProjectsClient",
     "RequestOptions",
     "TranscriptionStatus",
@@ -74,4 +78,4 @@ __all__ = [
     "WebhooksClient",
 ]
 
-__version__ = "0.1.7"
+__version__ = "0.2.0"

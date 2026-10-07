@@ -141,7 +141,7 @@ jobs:
           PY
 
       - name: Test
-        run: python -m pytest tests/test_client.py tests/test_transcription.py
+        run: python -m pytest tests/test_client.py tests/test_transcription.py tests/test_diffio_api_contract.py
 
       - name: Build
         if: ${{ steps.version.outputs.publish == 'true' }}

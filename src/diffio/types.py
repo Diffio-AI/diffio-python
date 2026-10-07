@@ -1,29 +1,84 @@
-class CreateProjectResponse:
+class ProjectUploadSession:
+    """Edge upload session from create_project; uploadToken authorizes only this project's upload."""
+
     def __init__(
         self,
-        apiProjectId,
-        uploadUrl,
-        uploadMethod,
-        objectPath,
-        bucket,
+        uploadSessionId,
+        edgeBaseUrl,
+        uploadToken,
+        objectKey,
+        partSizeBytes,
+        maxBytes,
         expiresAt,
     ):
-        self.apiProjectId = apiProjectId
-        self.uploadUrl = uploadUrl
-        self.uploadMethod = uploadMethod
-        self.objectPath = objectPath
-        self.bucket = bucket
+        self.uploadSessionId = uploadSessionId
+        self.edgeBaseUrl = edgeBaseUrl
+        self.uploadToken = uploadToken
+        self.objectKey = objectKey
+        self.partSizeBytes = partSizeBytes
+        self.maxBytes = maxBytes
         self.expiresAt = expiresAt
 
     @classmethod
     def from_dict(cls, data):
         return cls(
+            uploadSessionId=data["uploadSessionId"],
+            edgeBaseUrl=str(data["edgeBaseUrl"]).rstrip("/"),
+            uploadToken=data["uploadToken"],
+            objectKey=data["objectKey"],
+            partSizeBytes=int(data["partSizeBytes"]),
+            maxBytes=int(data["maxBytes"]),
+            expiresAt=data.get("expiresAt"),
+        )
+
+
+class CompleteProjectUploadResponse:
+    """Answer of /v1/complete_project_upload: the stored upload size once preprocessing can start."""
+
+    def __init__(self, apiProjectId, status, sizeBytes):
+        self.apiProjectId = apiProjectId
+        self.status = status
+        self.sizeBytes = sizeBytes
+
+    @classmethod
+    def from_dict(cls, data):
+        size_bytes = data.get("sizeBytes")
+        return cls(
             apiProjectId=data["apiProjectId"],
-            uploadUrl=data["uploadUrl"],
-            uploadMethod=data.get("uploadMethod") or "PUT",
-            objectPath=data["objectPath"],
-            bucket=data["bucket"],
-            expiresAt=data["expiresAt"],
+            status=data.get("status") or "uploaded",
+            sizeBytes=int(size_bytes) if size_bytes is not None else None,
+        )
+
+
+class CreateProjectResponse:
+    """A created project, its edge upload session, and (after create_project uploads) the upload completion."""
+
+    def __init__(
+        self,
+        apiProjectId,
+        upload,
+        objectPath,
+        expiresAt,
+        uploadCompletion=None,
+    ):
+        self.apiProjectId = apiProjectId
+        self.upload = upload
+        self.objectPath = objectPath
+        self.expiresAt = expiresAt
+        self.uploadCompletion = uploadCompletion
+
+    @classmethod
+    def from_dict(cls, data):
+        upload = data.get("upload")
+        if not isinstance(upload, dict):
+            raise ValueError(
+                "create_project response has no upload session; this SDK needs the edge upload API"
+            )
+        return cls(
+            apiProjectId=data["apiProjectId"],
+            upload=ProjectUploadSession.from_dict(upload),
+            objectPath=data.get("objectPath") or upload.get("objectKey"),
+            expiresAt=data.get("expiresAt") or upload.get("expiresAt"),
         )
 
 
@@ -194,6 +249,9 @@ class GenerationProgressResponse:
         error,
         errorDetails,
         transcription=None,
+        stage=None,
+        stageProgress=None,
+        queue=None,
     ):
         self.generationId = generationId
         self.apiProjectId = apiProjectId
@@ -205,6 +263,9 @@ class GenerationProgressResponse:
         self.error = error
         self.errorDetails = errorDetails
         self.transcription = transcription
+        self.stage = stage
+        self.stageProgress = stageProgress
+        self.queue = queue
 
     @classmethod
     def from_dict(cls, data):
@@ -224,6 +285,9 @@ class GenerationProgressResponse:
                 GenerationTranscription.from_dict(transcription)
                 if transcription is not None else None
             ),
+            stage=data.get("stage"),
+            stageProgress=data.get("stageProgress") if isinstance(data.get("stageProgress"), dict) else None,
+            queue=data.get("queue") if isinstance(data.get("queue"), dict) else None,
         )
 
 
@@ -236,7 +300,6 @@ class GenerationDownloadResponse:
         downloadUrl,
         fileName,
         storagePath,
-        bucket,
         mimeType,
     ):
         self.generationId = generationId
@@ -245,7 +308,6 @@ class GenerationDownloadResponse:
         self.downloadUrl = downloadUrl
         self.fileName = fileName
         self.storagePath = storagePath
-        self.bucket = bucket
         self.mimeType = mimeType
 
     @classmethod
@@ -255,10 +317,9 @@ class GenerationDownloadResponse:
             apiProjectId=data["apiProjectId"],
             downloadType=data["downloadType"],
             downloadUrl=data["downloadUrl"],
-            fileName=data["fileName"],
-            storagePath=data["storagePath"],
-            bucket=data["bucket"],
-            mimeType=data["mimeType"],
+            fileName=data.get("fileName"),
+            storagePath=data.get("storagePath"),
+            mimeType=data.get("mimeType"),
         )
 
 
@@ -451,7 +512,8 @@ class AudioIsolationResult:
         self.generation = generation
 
 
-ModelKey = ("diffio-2", "diffio-2-flash", "diffio-3.4", "diffio-3.5", "diffio-4.0-flash", "diffio-4.0-pro")
+# Models the API accepts; every other model id is retired and answered with HTTP 410 model_retired.
+ModelKey = ("diffio-4.5-flash", "diffio-4.5-pro")
 DownloadType = ("audio", "mp3", "video", "transcript")
 WebhookMode = ("test", "live")
 WebhookEventType = (

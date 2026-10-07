@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
+import socket
 import time
-from urllib.parse import urlparse
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 import pytest
@@ -11,7 +12,10 @@ import pytest
 from diffio import DiffioApiError, DiffioClient
 from emulator_api_key import EmulatorApiKeyError, create_emulator_api_key
 
-EMULATOR_BASE_URL = "http://127.0.0.1:5001/diffioai/us-central1"
+# Runs against a local Functions emulator plus edge Worker (diffio-ui `npm run local:start`). Point it at a
+# stack with DIFFIO_EMULATOR_API_BASE_URL (for example http://127.0.0.1:21003/demo-name/us-central1),
+# FIREBASE_PROJECT_ID, FIREBASE_AUTH_EMULATOR_HOST and FUNCTIONS_EMULATOR_HOST. Skipped when nothing listens.
+DEFAULT_EMULATOR_API_BASE_URL = "http://127.0.0.1:5001/diffioai/us-central1"
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 SAMPLE_AUDIO = FIXTURES_DIR / "sample-audio.mp3"
 
@@ -20,15 +24,29 @@ GENERATION_TIMEOUT_SECONDS = 300.0
 DOWNLOAD_TIMEOUT_SECONDS = 120.0
 
 
+def _emulator_api_base_url() -> str:
+    return os.environ.get("DIFFIO_EMULATOR_API_BASE_URL") or DEFAULT_EMULATOR_API_BASE_URL
+
+
+def _is_emulator_listening(base_url: str) -> bool:
+    parsed = urlparse(base_url)
+    try:
+        with socket.create_connection((parsed.hostname or "127.0.0.1", parsed.port or 80), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
 @pytest.fixture(scope="session")
 def emulator_env() -> None:
-    os.environ["DIFFIO_API_BASE_URL"] = EMULATOR_BASE_URL
+    base_url = _emulator_api_base_url()
+    if not _is_emulator_listening(base_url):
+        pytest.skip(f"No Functions emulator is listening at {base_url}.")
+    os.environ["DIFFIO_API_BASE_URL"] = base_url
     os.environ.setdefault("FIREBASE_PROJECT_ID", "diffioai")
     os.environ.setdefault("FIREBASE_AUTH_EMULATOR_HOST", "127.0.0.1:9099")
     os.environ.setdefault("FUNCTIONS_EMULATOR_HOST", "127.0.0.1:5001")
     os.environ.setdefault("FIREBASE_WEB_API_KEY", "fake-api-key")
-    os.environ.setdefault("FIREBASE_STORAGE_EMULATOR_HOST", "127.0.0.1:9199")
-    os.environ.setdefault("STORAGE_EMULATOR_HOST", "http://127.0.0.1:9199")
 
 
 @pytest.fixture(scope="session")
@@ -65,7 +83,7 @@ def _wait_for_generation_complete(
     generation_id: str,
     api_project_id: str,
     timeout_seconds: float = GENERATION_TIMEOUT_SECONDS,
-) -> tuple[object, float]:
+) -> object:
     deadline = time.monotonic() + timeout_seconds
     last_progress = None
 
@@ -77,7 +95,7 @@ def _wait_for_generation_complete(
         last_progress = progress
 
         if progress.status == "complete":
-            return progress, time.monotonic()
+            return progress
 
         if progress.status == "failed":
             raise AssertionError(
@@ -127,39 +145,12 @@ def _wait_for_download(
     raise AssertionError(message)
 
 
-def _needs_storage_emulator_auth(download_url: str) -> bool:
-    try:
-        parsed = urlparse(download_url)
-    except Exception:
-        return False
-
-    host = (parsed.hostname or "").lower()
-    port = parsed.port
-    if host in {"127.0.0.1", "localhost", "0.0.0.0", "::1"} and (port == 9199 or port is None):
-        return True
-
-    emulator_host = os.environ.get("STORAGE_EMULATOR_HOST") or os.environ.get("FIREBASE_STORAGE_EMULATOR_HOST")
-    if not emulator_host:
-        return False
-    if not emulator_host.startswith(("http://", "https://")):
-        emulator_host = f"http://{emulator_host}"
-    try:
-        emulator_parsed = urlparse(emulator_host)
-    except Exception:
-        return False
-    if host != (emulator_parsed.hostname or "").lower():
-        return False
-
-    parsed_port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    emulator_port = emulator_parsed.port or (443 if emulator_parsed.scheme == "https" else 80)
-    return parsed_port == emulator_port
-
-
 def test_emulator_create_project_appears_in_list(client: DiffioClient, sample_audio_path: Path) -> None:
     project = client.create_project(filePath=str(sample_audio_path))
 
-    assert project.uploadMethod in {"POST", "PUT"}
-    assert "/v0/b/" in project.uploadUrl
+    assert project.upload.edgeBaseUrl.startswith(("http://", "https://"))
+    assert project.uploadCompletion.status == "uploaded"
+    assert project.uploadCompletion.sizeBytes == sample_audio_path.stat().st_size
 
     projects = client.list_projects()
     project_ids = {item.apiProjectId for item in projects.projects}
@@ -170,7 +161,7 @@ def test_emulator_create_generation_appears_in_list(client: DiffioClient, sample
     project = client.create_project(filePath=str(sample_audio_path))
     generation = client.create_generation(
         apiProjectId=project.apiProjectId,
-        model="diffio-2-flash",
+        model="diffio-4.5-flash",
     )
 
     generations = client.list_project_generations(apiProjectId=project.apiProjectId)
@@ -185,11 +176,10 @@ def test_emulator_audio_isolation_full_flow_download(
     result = client.audio_isolation.isolate(
         filePath=str(sample_audio_path),
         contentType="audio/mpeg",
-        model="diffio-2-flash",
-        sampling={"steps": 10},
+        model="diffio-4.5-flash",
     )
 
-    progress, _ = _wait_for_generation_complete(
+    progress = _wait_for_generation_complete(
         client,
         generation_id=result.generation.generationId,
         api_project_id=result.project.apiProjectId,
@@ -205,8 +195,7 @@ def test_emulator_audio_isolation_full_flow_download(
         download_type="audio",
     )
 
-    headers = {"Authorization": "Bearer owner"} if _needs_storage_emulator_auth(download.downloadUrl) else None
-    response = httpx.get(download.downloadUrl, headers=headers, timeout=30.0)
+    response = httpx.get(download.downloadUrl, timeout=30.0)
     assert response.status_code == 200
     assert response.content
     assert download.mimeType.startswith("audio/")

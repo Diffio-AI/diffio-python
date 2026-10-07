@@ -5,58 +5,86 @@ from pathlib import Path
 import httpx
 import pytest
 
-from diffio import DiffioClient, ModelKey
-from diffio.client import MODEL_ENDPOINTS
+from diffio import CreateProjectResponse, DiffioClient, ModelKey
+from diffio.client import DEFAULT_MODEL_KEY, MODEL_ENDPOINTS, _plan_edge_upload_parts
 from diffio.errors import DiffioApiError
+from diffio_api_contract_fake import FakeDiffioApiContract
 
 
 def test_create_project_payload_and_headers(tmp_path: Path):
-    received = {}
+    fake = FakeDiffioApiContract(apiKey="diffio_live_test")
+    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=fake.build_http_client())
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/create_project":
-            received["path"] = request.url.path
-            received["auth"] = request.headers.get("Authorization")
-            payload = json.loads(request.content.decode("utf-8"))
-            received["payload"] = payload
-            return httpx.Response(
-                200,
-                json={
-                    "apiProjectId": "proj_123",
-                    "uploadUrl": "https://upload.test/upload",
-                    "uploadMethod": "PUT",
-                    "objectPath": "users/u/projects/proj_123/original/sample.txt",
-                    "bucket": "diffio_api",
-                    "expiresAt": "2026-01-24T00:00:00Z",
-                },
-            )
-
-        if request.url.host == "upload.test":
-            received["upload_method"] = request.method
-            received["upload_content_type"] = request.headers.get("Content-Type")
-            return httpx.Response(200, json={})
-
-        return httpx.Response(404, json={"error": "not found"})
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    file_path = tmp_path / "sample.txt"
-    file_path.write_text("hello world", encoding="utf-8")
+    file_path = tmp_path / "sample.wav"
+    file_path.write_bytes(b"RIFF-sample")
     expected_content_type, _ = mimetypes.guess_type(str(file_path))
     expected_content_type = expected_content_type or "application/octet-stream"
 
-    response = client.create_project(filePath=str(file_path))
+    response = client.create_project(filePath=str(file_path), fileFormat="wav", params={"source": "test"})
 
-    assert received["path"] == "/v1/create_project"
-    assert received["auth"] == "Bearer diffio_live_test"
-    assert received["payload"]["fileName"] == "sample.txt"
-    assert received["payload"]["contentType"] == expected_content_type
-    assert received["payload"]["contentLength"] == file_path.stat().st_size
-    assert received["upload_method"] == "PUT"
-    assert received["upload_content_type"] == expected_content_type
-    assert response.apiProjectId == "proj_123"
+    create_request = fake.requests_for_path("/v1/create_project")[0]
+    payload = json.loads(create_request.content.decode("utf-8"))
+    assert create_request.headers["Authorization"] == "Bearer diffio_live_test"
+    assert payload == {
+        "fileName": "sample.wav",
+        "contentType": expected_content_type,
+        "contentLength": file_path.stat().st_size,
+        "params": {"source": "test"},
+        "fileFormat": "wav",
+    }
+    assert response.apiProjectId in fake.projects
+    assert response.upload.uploadSessionId == f"api-{response.apiProjectId}"
+    assert response.upload.expiresAt == "2026-10-08T12:00:00Z"
+    assert response.expiresAt == "2026-10-08T12:00:00Z"
+    assert response.uploadCompletion.apiProjectId == response.apiProjectId
+
+
+def test_create_project_response_requires_upload_session():
+    with pytest.raises(ValueError, match="no upload session"):
+        CreateProjectResponse.from_dict({
+            "apiProjectId": "proj_legacy",
+            "uploadUrl": "https://storage.test/upload",
+            "objectPath": "users/u/projects/proj_legacy/original/input.wav",
+            "expiresAt": "2026-01-24T00:00:00Z",
+        })
+
+
+def test_complete_project_upload_payload_and_response():
+    received = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        received["path"] = request.url.path
+        received["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json={"apiProjectId": "proj_123", "status": "uploaded", "sizeBytes": 1234})
+
+    http_client = httpx.Client(base_url="https://api.test", transport=httpx.MockTransport(handler))
+    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
+
+    completion = client.projects.complete_upload(apiProjectId="proj_123")
+
+    assert received == {"path": "/v1/complete_project_upload", "payload": {"apiProjectId": "proj_123"}}
+    assert completion.status == "uploaded"
+    assert completion.sizeBytes == 1234
+
+
+def test_create_project_reports_missing_upload_from_completion(tmp_path: Path):
+    fake = FakeDiffioApiContract(apiKey="diffio_live_test")
+    original_complete = fake._complete_project_upload
+
+    def complete_before_storage(payload):
+        fake.storedObjects.clear()
+        return original_complete(payload)
+
+    fake._complete_project_upload = complete_before_storage
+    client = DiffioClient(apiKey="diffio_live_test", httpClient=fake.build_http_client())
+    file_path = tmp_path / "sample.wav"
+    file_path.write_bytes(b"RIFF")
+
+    with pytest.raises(DiffioApiError) as caught:
+        client.create_project(filePath=str(file_path))
+
+    assert caught.value.statusCode == 409
+    assert caught.value.responseBody["code"] == "UPLOAD_MISSING"
 
 
 def test_request_options_override_headers_and_api_key():
@@ -105,62 +133,28 @@ def test_request_options_retries_on_status():
     assert calls["count"] == 2
 
 
-def test_upload_file_streams_from_disk(monkeypatch):
-    class DummyFile:
-        def __init__(self):
-            self.read_calls = 0
-            self.closed = False
+def test_plan_edge_upload_parts_uses_fixed_part_size():
+    assert _plan_edge_upload_parts(0, 4) == [(1, 0, 0)]
+    assert _plan_edge_upload_parts(4, 4) == [(1, 0, 4)]
+    assert _plan_edge_upload_parts(9, 4) == [(1, 0, 4), (2, 4, 8), (3, 8, 9)]
 
-        def read(self, size=-1):
-            self.read_calls += 1
-            raise AssertionError("upload should not read the file into memory")
 
-        def __enter__(self):
-            return self
+def test_edge_upload_forwards_custom_headers_but_only_the_upload_token(tmp_path: Path):
+    fake = FakeDiffioApiContract(apiKey="diffio_live_test")
+    client = DiffioClient(apiKey="diffio_live_test", httpClient=fake.build_http_client())
+    file_path = tmp_path / "test.wav"
+    file_path.write_bytes(b"RIFF")
 
-        def __exit__(self, exc_type, exc, tb):
-            self.closed = True
-            return False
-
-    dummy_file = DummyFile()
-
-    def fake_open(path, mode):
-        assert mode == "rb"
-        return dummy_file
-
-    monkeypatch.setattr("builtins.open", fake_open)
-
-    class DummyClient:
-        def __init__(self):
-            self.request_args = None
-
-        def request(self, method, url, headers=None, content=None, json=None):
-            self.request_args = {
-                "method": method,
-                "url": url,
-                "headers": headers,
-                "content": content,
-                "json": json,
-            }
-            return httpx.Response(200, json={})
-
-        def close(self):
-            pass
-
-    http_client = DummyClient()
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    client._upload_file(
-        uploadUrl="https://upload.test/upload",
-        filePath="test.wav",
-        contentType="audio/wav",
+    project = client.create_project(
+        filePath=str(file_path),
         requestOptions={"headers": {"X-Upload": "1"}},
     )
 
-    assert dummy_file.read_calls == 0
-    assert dummy_file.closed is True
-    assert http_client.request_args["content"] is dummy_file
-    assert http_client.request_args["headers"]["X-Upload"] == "1"
+    edge_requests = [request for request in fake.requests if request.url.host == "media.test"]
+    assert edge_requests
+    for request in edge_requests:
+        assert request.headers["X-Upload"] == "1"
+        assert request.headers.get_list("Authorization") == [f"Bearer {project.upload.uploadToken}"]
 
 
 def test_wait_for_generation_reports_progress(monkeypatch):
@@ -223,50 +217,8 @@ def test_wait_for_generation_reports_progress(monkeypatch):
 
 
 def test_audio_isolation_isolate_runs_full_flow(tmp_path: Path):
-    calls = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append((request.method, str(request.url)))
-
-        if request.url.path == "/v1/create_project":
-            payload = json.loads(request.content.decode("utf-8"))
-            assert payload["fileName"] == "input.wav"
-            return httpx.Response(
-                200,
-                json={
-                    "apiProjectId": "proj_abc",
-                    "uploadUrl": "https://upload.test/upload",
-                    "uploadMethod": "PUT",
-                    "objectPath": "users/u/projects/proj_abc/original/input.wav",
-                    "bucket": "diffio_api",
-                    "expiresAt": "2026-01-24T00:00:00Z",
-                },
-            )
-
-        if request.url.host == "upload.test":
-            assert request.headers.get("Authorization") is None
-            assert request.headers.get("Content-Type") == "audio/wav"
-            return httpx.Response(200)
-
-        if request.url.path in ("/v1/diffio-2.0-generation", "/v1/diffio-4.0-flash-generation"):
-            payload = json.loads(request.content.decode("utf-8"))
-            assert payload["apiProjectId"] == "proj_abc"
-            assert payload["sampling"]["steps"] == 10
-            return httpx.Response(
-                200,
-                json={
-                    "generationId": "gen_123",
-                    "apiProjectId": "proj_abc",
-                    "modelKey": "diffio-4.0-flash" if "4.0-flash" in request.url.path else "diffio-2",
-                    "status": "queued",
-                },
-            )
-
-        return httpx.Response(404, json={"error": "not found"})
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
+    fake = FakeDiffioApiContract(apiKey="diffio_live_test")
+    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=fake.build_http_client())
 
     file_path = tmp_path / "input.wav"
     file_path.write_bytes(b"test data")
@@ -274,18 +226,24 @@ def test_audio_isolation_isolate_runs_full_flow(tmp_path: Path):
     result = client.audio_isolation.isolate(
         filePath=str(file_path),
         contentType="audio/wav",
-        model="diffio-2",
+        model="diffio-4.5-pro",
         sampling={"steps": 10},
     )
 
-    assert result.project.apiProjectId == "proj_abc"
-    assert result.generation.generationId == "gen_123"
-    assert calls[0][0] == "POST"
-    assert calls[1][0] == "PUT"
-    assert calls[2][0] == "POST"
+    assert result.project.apiProjectId in fake.projects
+    assert result.generation.modelKey == "diffio-4.5-pro"
+    assert fake.generations[result.generation.generationId]["sampling"] == {"steps": 10}
+    assert [(request.method, request.url.path) for request in fake.requests] == [
+        ("POST", "/v1/create_project"),
+        ("POST", "/v1/uploads/start"),
+        ("PUT", "/v1/uploads/parts/1"),
+        ("POST", "/v1/uploads/complete"),
+        ("POST", "/v1/complete_project_upload"),
+        ("POST", "/v1/diffio-4.5-pro-generation"),
+    ]
 
 
-def test_create_generation_routes_to_diffio_3_5_endpoint():
+def test_create_generation_routes_to_diffio_4_5_pro_endpoint():
     received = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -295,9 +253,9 @@ def test_create_generation_routes_to_diffio_3_5_endpoint():
         return httpx.Response(
             200,
             json={
-                "generationId": "gen_35",
-                "apiProjectId": "proj_35",
-                "modelKey": "diffio-3.5",
+                "generationId": "gen_45",
+                "apiProjectId": "proj_45",
+                "modelKey": "diffio-4.5-pro",
                 "status": "queued",
             },
         )
@@ -306,12 +264,12 @@ def test_create_generation_routes_to_diffio_3_5_endpoint():
     http_client = httpx.Client(base_url="https://api.test", transport=transport)
     client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
 
-    response = client.create_generation(apiProjectId="proj_35", model="diffio-3.5")
+    response = client.create_generation(apiProjectId="proj_45", model="diffio-4.5-pro")
 
-    assert received["path"] == "/v1/diffio-3.5-generation"
-    assert received["payload"]["apiProjectId"] == "proj_35"
+    assert received["path"] == "/v1/diffio-4.5-pro-generation"
+    assert received["payload"]["apiProjectId"] == "proj_45"
     assert "idempotencyKey" not in received["payload"]
-    assert response.modelKey == "diffio-3.5"
+    assert response.modelKey == "diffio-4.5-pro"
     assert response.idempotentReplay is None
 
 
@@ -326,7 +284,7 @@ def test_create_generation_sends_idempotency_key_and_parses_replay():
             json={
                 "generationId": "gen_original",
                 "apiProjectId": "proj_123",
-                "modelKey": "diffio-4.0-flash" if "4.0-flash" in request.url.path else "diffio-2",
+                "modelKey": "diffio-4.5-flash",
                 "status": "queued",
                 "idempotentReplay": True,
             },
@@ -341,7 +299,7 @@ def test_create_generation_sends_idempotency_key_and_parses_replay():
         idempotencyKey="restore-job-2026-001",
     )
 
-    assert received["path"] == "/v1/diffio-4.0-flash-generation"
+    assert received["path"] == "/v1/diffio-4.5-flash-generation"
     assert received["payload"] == {
         "apiProjectId": "proj_123",
         "idempotencyKey": "restore-job-2026-001",
@@ -360,7 +318,7 @@ def test_generations_create_forwards_idempotency_key():
             json={
                 "generationId": "gen_123",
                 "apiProjectId": "proj_123",
-                "modelKey": "diffio-4.0-flash" if "4.0-flash" in request.url.path else "diffio-2",
+                "modelKey": "diffio-4.5-flash",
                 "status": "queued",
             },
         )
@@ -382,14 +340,14 @@ def test_generations_create_and_wait_forwards_idempotency_key():
     received = {}
 
     def handler(request):
-        if request.url.path in ("/v1/diffio-2.0-generation", "/v1/diffio-4.0-flash-generation"):
+        if request.url.path == "/v1/diffio-4.5-flash-generation":
             received["createPayload"] = json.loads(request.content.decode("utf-8"))
             return httpx.Response(
                 200,
                 json={
                     "generationId": "gen_123",
                     "apiProjectId": "proj_123",
-                    "modelKey": "diffio-4.0-flash" if "4.0-flash" in request.url.path else "diffio-2",
+                    "modelKey": "diffio-4.5-flash",
                     "status": "queued",
                     "idempotentReplay": False,
                 },
@@ -443,10 +401,51 @@ def test_generations_create_and_wait_forwards_idempotency_key():
 
 
 def test_advertised_models_match_runtime_model_support():
-    assert set(ModelKey) == set(MODEL_ENDPOINTS)
-    assert "diffio-3" not in ModelKey
-    assert "diffio-3.0-generation" not in MODEL_ENDPOINTS.values()
-    assert MODEL_ENDPOINTS["diffio-3.4"] == "diffio-3.4-generation"
+    assert set(ModelKey) == set(MODEL_ENDPOINTS) == {"diffio-4.5-flash", "diffio-4.5-pro"}
+    assert MODEL_ENDPOINTS == {
+        "diffio-4.5-flash": "diffio-4.5-flash-generation",
+        "diffio-4.5-pro": "diffio-4.5-pro-generation",
+    }
+    assert DEFAULT_MODEL_KEY == "diffio-4.5-flash"
+
+
+def test_existing_generations_with_retired_models_still_parse(tmp_path: Path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/list_project_generations":
+            return httpx.Response(200, json={
+                "apiProjectId": "proj_old",
+                "generations": [
+                    {"generationId": "gen_old", "status": "complete", "modelKey": "diffio-2",
+                     "progress": 100, "createdAt": None, "updatedAt": None},
+                    {"generationId": "gen_old_35", "status": "complete", "modelKey": "diffio-3.5",
+                     "progress": 100, "createdAt": None, "updatedAt": None},
+                ],
+            })
+        if request.url.path == "/v1/get_generation_download":
+            return httpx.Response(200, json={
+                "generationId": "gen_old",
+                "apiProjectId": "proj_old",
+                "downloadType": "audio",
+                "downloadUrl": "https://media.test/m/token/generations/gen_old/restored.mp3",
+                "fileName": "diffio_ai_old.mp3",
+                "storagePath": "api/users/u/projects/proj_old/generations/gen_old/restored.mp3",
+                "mimeType": "audio/mpeg",
+            })
+        if request.url.host == "media.test":
+            return httpx.Response(200, content=b"old-restored-audio")
+        return httpx.Response(404, json={"error": "not found"})
+
+    http_client = httpx.Client(base_url="https://api.test", transport=httpx.MockTransport(handler))
+    client = DiffioClient(apiKey="diffio_live_test", httpClient=http_client)
+
+    generations = client.projects.list_generations(apiProjectId="proj_old")
+    download_path = tmp_path / "old.mp3"
+    download = client.generations.download(generationId="gen_old", apiProjectId="proj_old",
+                                           downloadFilePath=str(download_path))
+
+    assert [generation.modelKey for generation in generations.generations] == ["diffio-2", "diffio-3.5"]
+    assert download.fileName == "diffio_ai_old.mp3"
+    assert download_path.read_bytes() == b"old-restored-audio"
 
 
 @pytest.mark.parametrize("transcription_status", [None, "pending", "available", "unavailable"])
@@ -461,20 +460,38 @@ def test_restore_audio_runs_full_flow_and_downloads(tmp_path, monkeypatch, trans
                 200,
                 json={
                     "apiProjectId": "proj_abc",
-                    "uploadUrl": "https://upload.test/upload",
-                    "uploadMethod": "PUT",
-                    "objectPath": "users/u/projects/proj_abc/original/input.wav",
-                    "bucket": "diffio_api",
+                    "upload": {
+                        "uploadSessionId": "api-proj_abc",
+                        "edgeBaseUrl": "https://upload.test/",
+                        "uploadToken": "v1.upload.sig",
+                        "objectKey": "api/users/u/projects/proj_abc/original/input.wav",
+                        "partSizeBytes": 33554432,
+                        "maxBytes": 2147483648,
+                        "expiresAt": "2026-01-24T00:00:00Z",
+                    },
+                    "objectPath": "api/users/u/projects/proj_abc/original/input.wav",
                     "expiresAt": "2026-01-24T00:00:00Z",
                 },
             )
 
         if request.url.host == "upload.test":
-            assert request.headers.get("Authorization") is None
-            assert request.headers.get("Content-Type") == "audio/wav"
-            return httpx.Response(200)
+            assert request.headers.get("Authorization") == "Bearer v1.upload.sig"
+            if request.url.path == "/v1/uploads/start":
+                return httpx.Response(200, json={"uploadId": "up_1", "partSizeBytes": 33554432,
+                                                 "maxBytes": 2147483648})
+            if request.url.path == "/v1/uploads/parts/1":
+                assert request.url.params["uploadId"] == "up_1"
+                assert request.content == b"test data"
+                return httpx.Response(200, json={"partNumber": 1, "etag": "etag-1"})
+            if request.url.path == "/v1/uploads/complete":
+                assert json.loads(request.content) == {"uploadId": "up_1",
+                                                       "parts": [{"partNumber": 1, "etag": "etag-1"}]}
+                return httpx.Response(200, json={"objectKey": "k", "sizeBytes": 9, "etag": "e"})
 
-        if request.url.path in ("/v1/diffio-2.0-generation", "/v1/diffio-4.0-flash-generation"):
+        if request.url.path == "/v1/complete_project_upload":
+            return httpx.Response(200, json={"apiProjectId": "proj_abc", "status": "uploaded", "sizeBytes": 9})
+
+        if request.url.path == "/v1/diffio-4.5-flash-generation":
             payload = json.loads(request.content.decode("utf-8"))
             assert payload["apiProjectId"] == "proj_abc"
             assert payload["sampling"]["steps"] == 10
@@ -483,7 +500,7 @@ def test_restore_audio_runs_full_flow_and_downloads(tmp_path, monkeypatch, trans
                 json={
                     "generationId": "gen_123",
                     "apiProjectId": "proj_abc",
-                    "modelKey": "diffio-4.0-flash" if "4.0-flash" in request.url.path else "diffio-2",
+                    "modelKey": "diffio-4.5-flash",
                     "status": "queued",
                 },
             )
@@ -532,7 +549,6 @@ def test_restore_audio_runs_full_flow_and_downloads(tmp_path, monkeypatch, trans
                     "downloadUrl": "https://download.test/output.mp3",
                     "fileName": "diffio_ai_input.mp3",
                     "storagePath": "users/u/projects/proj_abc/generations/gen_123/restored.mp3",
-                    "bucket": "diffio_api",
                     "mimeType": "audio/mpeg",
                 },
             )
@@ -556,7 +572,7 @@ def test_restore_audio_runs_full_flow_and_downloads(tmp_path, monkeypatch, trans
     content, info = client.restore_audio(
         filePath=str(file_path),
         contentType="audio/wav",
-        model="diffio-2",
+        model="diffio-4.5-flash",
         sampling={"steps": 10},
         pollInterval=0.0,
     )
@@ -663,7 +679,6 @@ def test_get_generation_download_payload_and_response():
                 "downloadUrl": "https://storage.test/download",
                 "fileName": "diffio_ai_input.wav",
                 "storagePath": "users/u/projects/proj_456/generations/gen_456/restored.mp3",
-                "bucket": "diffio_api",
                 "mimeType": "audio/mpeg",
             },
         )
@@ -703,7 +718,6 @@ def test_get_generation_download_accepts_transcript():
                 "downloadUrl": "https://storage.test/word_timestamps.json",
                 "fileName": "word_timestamps.json",
                 "storagePath": "users/u/projects/proj_456/generations/gen_456/word_timestamps.json",
-                "bucket": "diffio_api",
                 "mimeType": "application/json",
             },
         )
@@ -740,7 +754,6 @@ def test_generation_download_writes_file(tmp_path: Path):
                     "downloadUrl": "https://download.test/restored.mp3",
                     "fileName": "restored.mp3",
                     "storagePath": "users/u/projects/proj_789/generations/gen_789/restored.mp3",
-                    "bucket": "diffio_api",
                     "mimeType": "audio/mpeg",
                 },
             )
@@ -781,7 +794,6 @@ def test_generation_download_warns_on_extension_mismatch(tmp_path: Path):
                     "downloadUrl": "https://download.test/restored.mp3",
                     "fileName": "restored.mp3",
                     "storagePath": "users/u/projects/proj_111/generations/gen_111/restored.mp3",
-                    "bucket": "diffio_api",
                     "mimeType": "audio/mpeg",
                 },
             )
@@ -861,7 +873,7 @@ def test_list_project_generations_payload_and_response():
                     {
                         "generationId": "gen_123",
                         "status": "processing",
-                        "modelKey": "diffio-4.0-flash" if "4.0-flash" in request.url.path else "diffio-2",
+                        "modelKey": "diffio-4.5-flash",
                         "progress": None,
                         "createdAt": "2026-01-05T12:40:00Z",
                         "updatedAt": "2026-01-05T12:41:00Z",

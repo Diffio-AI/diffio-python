@@ -52,9 +52,30 @@ projects = client.list_projects(
 )
 ```
 
+## Models
+
+Diffio 4.5 Flash (`diffio-4.5-flash`) and Diffio 4.5 Pro (`diffio-4.5-pro`) are the only
+models. `diffio-4.5-flash` is the default and works on every plan; `diffio-4.5-pro` needs a
+paid plan. Any other model id raises `ValueError` before a request is sent (the API answers
+retired model endpoints with HTTP 410 and code `model_retired`). Existing generations created
+with older models keep their `modelKey` and can still be listed, polled, and downloaded.
+
 ## Create a project and generation
 
-`create_project` uploads the file and returns the project metadata.
+`create_project` creates the project, uploads the file, and confirms the upload:
+
+1. `POST /v1/create_project` returns the project id and an upload session (`project.upload`):
+   `edgeBaseUrl`, `uploadToken`, `objectKey`, `partSizeBytes` (32 MiB), `maxBytes`, `expiresAt`.
+2. The file goes to the Diffio upload API at `edgeBaseUrl` in `partSizeBytes` parts
+   (`/v1/uploads/start`, `/v1/uploads/parts/{n}`, `/v1/uploads/complete`), authorized with
+   `Authorization: Bearer {uploadToken}`. Your API key is never sent to the upload API.
+   With `maxRetries` set, a failed part is retried on its own instead of resending the file.
+   If a part still fails, the SDK aborts the partial upload and raises `DiffioApiError`.
+3. `POST /v1/complete_project_upload` confirms the upload so preprocessing starts. Its answer is
+   on `project.uploadCompletion` (`status`, `sizeBytes`). It is idempotent; you can call
+   `client.complete_project_upload(apiProjectId=...)` (or `client.projects.complete_upload`) again.
+
+Files larger than the session's `maxBytes` (2 GiB) raise `ValueError` before any bytes are sent.
 
 ```py
 from diffio import DiffioClient
@@ -67,8 +88,7 @@ project = client.create_project(
 
 generation = client.create_generation(
     apiProjectId=project.apiProjectId,
-    model="diffio-4.0-flash",
-    sampling={"steps": 12, "guidance": 1.5},
+    model="diffio-4.5-flash",
     idempotencyKey="restore-job-2026-001",
     requestOptions={"maxRetries": 2},
 )
@@ -89,8 +109,7 @@ from diffio import DiffioClient
 client = DiffioClient(apiKey="diffio_live_...")
 result = client.audio_isolation.isolate(
     filePath="sample.wav",
-    model="diffio-4.0-flash",
-    sampling={"steps": 12, "guidance": 1.5},
+    model="diffio-4.5-flash",
 )
 
 print(result.generation.generationId)
@@ -106,8 +125,7 @@ from diffio import DiffioClient
 client = DiffioClient(apiKey="diffio_live_...")
 audio_bytes, info = client.restore_audio(
     filePath="sample.wav",
-    model="diffio-4.0-flash",
-    sampling={"steps": 12, "guidance": 1.5},
+    model="diffio-4.5-flash",
     onProgress=lambda progress: print(progress.status),
 )
 
@@ -127,10 +145,13 @@ print(info["apiProjectId"], info["generationId"])
 restoration or final settlement is still pending; stage progress alone does not
 indicate overall completion.
 
-For Diffio 2.0, `complete` means restored media is ready. Transcription can still
-be `pending`, become `available` later, or finish as `unavailable`. Read
-`progress.transcription.status` independently; `progress.transcription` is `None`
-for older responses that do not report availability. A completed generation
+`complete` means restored media is ready. Diffio 4.5 transcribes the recording
+before restoration starts, so a completed generation has its transcript; while a
+generation runs, transcription can be `pending`, `available`, or `unavailable`.
+Read `progress.transcription.status` independently; `progress.transcription` is `None`
+for older responses that do not report availability. `progress.stage`,
+`progress.stageProgress`, and `progress.queue` (fleet queue position and message)
+are set while the API reports them and `None` otherwise. A completed generation
 remains successful if transcription is unavailable. Completion webhooks expose
 the same optional `event.transcription` object; a later transcript does not emit
 another `generation.completed` event.
@@ -165,7 +186,9 @@ download = client.generations.download(
 print(download.downloadUrl)
 ```
 
-If you only need the URL, use `client.generations.get_download`.
+If you only need the URL, use `client.generations.get_download`. Download URLs point at the
+Diffio media host, need no extra headers, and are valid for 6 hours. The response has
+`downloadType`, `downloadUrl`, `fileName`, `storagePath`, and `mimeType`.
 
 Set `downloadType="transcript"` to download the transcript JSON artifact when the generation has one.
 Pending transcripts return `DiffioApiError` with `statusCode == 409` and
@@ -288,6 +311,23 @@ async def diffio_webhook(request: Request):
     print("Webhook received", event.eventType)
     return {"ok": True}
 ```
+
+## Upgrading to 0.2.0
+
+0.2.0 follows the Diffio 4.5 API. It has breaking changes:
+
+* Only `diffio-4.5-flash` and `diffio-4.5-pro` are accepted, and the default model is
+  `diffio-4.5-flash`. `diffio-2`, `diffio-2-flash`, `diffio-3.4`, `diffio-3.5`,
+  `diffio-4.0-flash`, and `diffio-4.0-pro` were removed with no aliases.
+* `CreateProjectResponse` no longer has `uploadUrl`, `uploadMethod`, or `bucket`. It has
+  `upload` (a `ProjectUploadSession`) and `uploadCompletion` (a `CompleteProjectUploadResponse`).
+  Uploads use the multipart upload API instead of a single signed PUT.
+* `GenerationDownloadResponse` no longer has `bucket`.
+* Error messages from the upload API (`{"error": {"code", "message"}}`) become the
+  `DiffioApiError` message; the full body stays in `responseBody`.
+
+Earlier SDK releases cannot upload to the current API: `create_project` fails with
+`KeyError: 'uploadUrl'`.
 
 ## Tutorials
 
