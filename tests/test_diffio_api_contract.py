@@ -142,7 +142,7 @@ def test_create_project_refuses_file_larger_than_session_limit(tmp_path):
     assert _edge_upload_requests(fake) == []
 
 
-def test_create_generation_defaults_to_diffio_4_5_flash(tmp_path):
+def test_create_generation_defaults_to_diffio_4_6_flash(tmp_path):
     fake = FakeDiffioApiContract()
     audio_path = tmp_path / "sample.mp3"
     audio_path.write_bytes(b"ID3")
@@ -150,12 +150,47 @@ def test_create_generation_defaults_to_diffio_4_5_flash(tmp_path):
     project = client.create_project(filePath=str(audio_path))
 
     generation = client.create_generation(apiProjectId=project.apiProjectId)
-    pro_generation = client.generations.create(apiProjectId=project.apiProjectId, model="diffio-4.5-pro")
+    pro_generation = client.generations.create(apiProjectId=project.apiProjectId, model="diffio-4.6-pro")
 
-    assert generation.modelKey == "diffio-4.5-flash"
-    assert pro_generation.modelKey == "diffio-4.5-pro"
-    assert len(fake.requests_for_path("/v1/diffio-4.5-flash-generation")) == 1
-    assert len(fake.requests_for_path("/v1/diffio-4.5-pro-generation")) == 1
+    assert generation.modelKey == "diffio-4.6-flash"
+    assert pro_generation.modelKey == "diffio-4.6-pro"
+    assert len(fake.requests_for_path("/v1/diffio-4.6-flash-generation")) == 1
+    assert len(fake.requests_for_path("/v1/diffio-4.6-pro-generation")) == 1
+
+
+@pytest.mark.parametrize("legacyModel, expectedModel", [
+    ("diffio-4.5-flash", "diffio-4.6-flash"),
+    ("diffio-4.5-pro", "diffio-4.6-pro"),
+])
+def test_create_generation_runs_0_2_model_keys_on_4_6(tmp_path, legacyModel, expectedModel):
+    fake = FakeDiffioApiContract()
+    audio_path = tmp_path / "sample.mp3"
+    audio_path.write_bytes(b"ID3")
+    client = _build_contract_client(fake)
+    project = client.create_project(filePath=str(audio_path))
+
+    generation = client.create_generation(apiProjectId=project.apiProjectId, model=legacyModel)
+
+    assert generation.modelKey == expectedModel
+    assert len(fake.requests_for_path(f"/v1/{expectedModel}-generation")) == 1
+    assert fake.requests_for_path(f"/v1/{legacyModel}-generation") == []
+
+
+def test_fake_api_answers_retired_model_endpoint_with_4_6_guidance():
+    fake = FakeDiffioApiContract()
+    http_client = fake.build_http_client()
+
+    response = http_client.post("/v1/diffio-4.0-pro-generation", json={"apiProjectId": "proj"},
+                                headers={"Authorization": f"Bearer {fake.apiKey}"})
+
+    assert response.status_code == 410
+    assert response.json() == {
+        "error": "diffio-4.0-pro has been retired. Use diffio-4.6-flash or diffio-4.6-pro "
+                 "(/v1/diffio-4.6-flash-generation or /v1/diffio-4.6-pro-generation).",
+        "code": "model_retired",
+        "retiredModel": "diffio-4.0-pro",
+        "supportedModels": ["diffio-4.6-flash", "diffio-4.6-pro"],
+    }
 
 
 @pytest.mark.parametrize("retiredModel", [
@@ -165,7 +200,7 @@ def test_create_generation_rejects_retired_model_before_sending(retiredModel):
     fake = FakeDiffioApiContract()
     client = _build_contract_client(fake)
 
-    with pytest.raises(ValueError, match="diffio-4.5-flash"):
+    with pytest.raises(ValueError, match="diffio-4.6-flash"):
         client.create_generation(apiProjectId="proj", model=retiredModel)
 
     assert fake.requests == []
@@ -173,7 +208,7 @@ def test_create_generation_rejects_retired_model_before_sending(retiredModel):
 
 def test_get_generation_download_parses_edge_media_response(tmp_path):
     fake = FakeDiffioApiContract()
-    fake.generations["gen-1"] = {"apiProjectId": "proj-1", "modelKey": "diffio-4.5-flash"}
+    fake.generations["gen-1"] = {"apiProjectId": "proj-1", "modelKey": "diffio-4.6-flash"}
     client = _build_contract_client(fake)
 
     download = client.get_generation_download(generationId="gen-1", apiProjectId="proj-1")
@@ -200,5 +235,5 @@ def test_restore_audio_runs_against_current_api_contract(tmp_path):
     assert info["error"] is None
     assert info["ok"] is True
     assert content == FAKE_RESTORED_AUDIO_BYTES
-    assert info["generation"].modelKey == "diffio-4.5-flash"
+    assert info["generation"].modelKey == "diffio-4.6-flash"
     assert read_stored_upload_bytes(fake, info["apiProjectId"]) == b"ID3-sample-audio"

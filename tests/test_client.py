@@ -269,12 +269,12 @@ def test_audio_isolation_isolate_runs_full_flow(tmp_path: Path):
     result = client.audio_isolation.isolate(
         filePath=str(file_path),
         contentType="audio/wav",
-        model="diffio-4.5-pro",
+        model="diffio-4.6-pro",
         sampling={"steps": 10},
     )
 
     assert result.project.apiProjectId in fake.projects
-    assert result.generation.modelKey == "diffio-4.5-pro"
+    assert result.generation.modelKey == "diffio-4.6-pro"
     assert fake.generations[result.generation.generationId]["sampling"] == {"steps": 10}
     assert [(request.method, request.url.path) for request in fake.requests] == [
         ("POST", "/v1/create_project"),
@@ -282,11 +282,11 @@ def test_audio_isolation_isolate_runs_full_flow(tmp_path: Path):
         ("PUT", "/v1/uploads/parts/1"),
         ("POST", "/v1/uploads/complete"),
         ("POST", "/v1/complete_project_upload"),
-        ("POST", "/v1/diffio-4.5-pro-generation"),
+        ("POST", "/v1/diffio-4.6-pro-generation"),
     ]
 
 
-def test_create_generation_routes_to_diffio_4_5_pro_endpoint():
+def test_create_generation_routes_to_diffio_4_6_pro_endpoint():
     received = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -296,9 +296,9 @@ def test_create_generation_routes_to_diffio_4_5_pro_endpoint():
         return httpx.Response(
             200,
             json={
-                "generationId": "gen_45",
-                "apiProjectId": "proj_45",
-                "modelKey": "diffio-4.5-pro",
+                "generationId": "gen_46",
+                "apiProjectId": "proj_46",
+                "modelKey": "diffio-4.6-pro",
                 "status": "queued",
             },
         )
@@ -307,12 +307,12 @@ def test_create_generation_routes_to_diffio_4_5_pro_endpoint():
     http_client = httpx.Client(base_url="https://api.test", transport=transport)
     client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
 
-    response = client.create_generation(apiProjectId="proj_45", model="diffio-4.5-pro")
+    response = client.create_generation(apiProjectId="proj_46", model="diffio-4.6-pro")
 
-    assert received["path"] == "/v1/diffio-4.5-pro-generation"
-    assert received["payload"]["apiProjectId"] == "proj_45"
+    assert received["path"] == "/v1/diffio-4.6-pro-generation"
+    assert received["payload"]["apiProjectId"] == "proj_46"
     assert "idempotencyKey" not in received["payload"]
-    assert response.modelKey == "diffio-4.5-pro"
+    assert response.modelKey == "diffio-4.6-pro"
     assert response.idempotentReplay is None
 
 
@@ -327,7 +327,7 @@ def test_create_generation_sends_idempotency_key_and_parses_replay():
             json={
                 "generationId": "gen_original",
                 "apiProjectId": "proj_123",
-                "modelKey": "diffio-4.5-flash",
+                "modelKey": "diffio-4.6-flash",
                 "status": "queued",
                 "idempotentReplay": True,
             },
@@ -342,7 +342,7 @@ def test_create_generation_sends_idempotency_key_and_parses_replay():
         idempotencyKey="restore-job-2026-001",
     )
 
-    assert received["path"] == "/v1/diffio-4.5-flash-generation"
+    assert received["path"] == "/v1/diffio-4.6-flash-generation"
     assert received["payload"] == {
         "apiProjectId": "proj_123",
         "idempotencyKey": "restore-job-2026-001",
@@ -361,7 +361,7 @@ def test_generations_create_forwards_idempotency_key():
             json={
                 "generationId": "gen_123",
                 "apiProjectId": "proj_123",
-                "modelKey": "diffio-4.5-flash",
+                "modelKey": "diffio-4.6-flash",
                 "status": "queued",
             },
         )
@@ -383,14 +383,14 @@ def test_generations_create_and_wait_forwards_idempotency_key():
     received = {}
 
     def handler(request):
-        if request.url.path == "/v1/diffio-4.5-flash-generation":
+        if request.url.path == "/v1/diffio-4.6-flash-generation":
             received["createPayload"] = json.loads(request.content.decode("utf-8"))
             return httpx.Response(
                 200,
                 json={
                     "generationId": "gen_123",
                     "apiProjectId": "proj_123",
-                    "modelKey": "diffio-4.5-flash",
+                    "modelKey": "diffio-4.6-flash",
                     "status": "queued",
                     "idempotentReplay": False,
                 },
@@ -444,12 +444,78 @@ def test_generations_create_and_wait_forwards_idempotency_key():
 
 
 def test_advertised_models_match_runtime_model_support():
-    assert set(ModelKey) == set(MODEL_ENDPOINTS) == {"diffio-4.5-flash", "diffio-4.5-pro"}
+    assert set(ModelKey) == set(MODEL_ENDPOINTS) == {"diffio-4.6-flash", "diffio-4.6-pro"}
     assert MODEL_ENDPOINTS == {
-        "diffio-4.5-flash": "diffio-4.5-flash-generation",
-        "diffio-4.5-pro": "diffio-4.5-pro-generation",
+        "diffio-4.6-flash": "diffio-4.6-flash-generation",
+        "diffio-4.6-pro": "diffio-4.6-pro-generation",
     }
-    assert DEFAULT_MODEL_KEY == "diffio-4.5-flash"
+    assert DEFAULT_MODEL_KEY == "diffio-4.6-flash"
+
+
+def _recording_generation_client(received_paths):
+    def handler(request):
+        received_paths.append(request.url.path)
+        model_key = request.url.path[len("/v1/"):-len("-generation")]
+        return httpx.Response(200, json={"generationId": "gen_1", "apiProjectId": "proj_1",
+                                         "modelKey": model_key, "status": "queued"})
+
+    http_client = httpx.Client(base_url="https://api.test", transport=httpx.MockTransport(handler))
+    return DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
+
+
+def test_create_generation_defaults_to_diffio_4_6_flash_endpoint():
+    received_paths = []
+    client = _recording_generation_client(received_paths)
+
+    response = client.create_generation(apiProjectId="proj_1")
+    wrapped = client.generations.create(apiProjectId="proj_1")
+
+    assert received_paths == ["/v1/diffio-4.6-flash-generation", "/v1/diffio-4.6-flash-generation"]
+    assert response.modelKey == wrapped.modelKey == "diffio-4.6-flash"
+
+
+@pytest.mark.parametrize("model, expectedPath", [
+    ("diffio-4.6-flash", "/v1/diffio-4.6-flash-generation"),
+    ("diffio-4.6-pro", "/v1/diffio-4.6-pro-generation"),
+])
+def test_create_generation_routes_4_6_models_to_their_endpoints(model, expectedPath):
+    received_paths = []
+    client = _recording_generation_client(received_paths)
+
+    response = client.create_generation(apiProjectId="proj_1", model=model)
+
+    assert received_paths == [expectedPath]
+    assert response.modelKey == model
+
+
+@pytest.mark.parametrize("legacyModel, expectedPath", [
+    ("diffio-4.5-flash", "/v1/diffio-4.6-flash-generation"),
+    ("diffio-4.5-pro", "/v1/diffio-4.6-pro-generation"),
+])
+def test_create_generation_routes_0_2_model_keys_to_matching_4_6_endpoint(legacyModel, expectedPath, recwarn):
+    received_paths = []
+    client = _recording_generation_client(received_paths)
+
+    response = client.create_generation(apiProjectId="proj_1", model=legacyModel)
+    wrapped = client.generations.create(apiProjectId="proj_1", model=legacyModel)
+
+    assert received_paths == [expectedPath, expectedPath]
+    assert response.modelKey == wrapped.modelKey == expectedPath[len("/v1/"):-len("-generation")]
+    assert len(recwarn) == 0
+    assert legacyModel not in ModelKey
+
+
+@pytest.mark.parametrize("unknownModel", [
+    "diffio-4.0-flash", "diffio-4.5", "diffio-4.6", "diffio-4.6-ultra", "diffio-4.7-flash", "", None,
+])
+def test_create_generation_rejects_unknown_models_naming_4_6(unknownModel):
+    received_paths = []
+    client = _recording_generation_client(received_paths)
+
+    with pytest.raises(ValueError, match="Unsupported model: .*use diffio-4.6-flash or diffio-4.6-pro"):
+        client.create_generation(apiProjectId="proj_1", model=unknownModel)
+
+    assert received_paths == []
 
 
 def test_existing_generations_with_retired_models_still_parse(tmp_path: Path):
@@ -534,7 +600,7 @@ def test_restore_audio_runs_full_flow_and_downloads(tmp_path, monkeypatch, trans
         if request.url.path == "/v1/complete_project_upload":
             return httpx.Response(200, json={"apiProjectId": "proj_abc", "status": "uploaded", "sizeBytes": 9})
 
-        if request.url.path == "/v1/diffio-4.5-flash-generation":
+        if request.url.path == "/v1/diffio-4.6-flash-generation":
             payload = json.loads(request.content.decode("utf-8"))
             assert payload["apiProjectId"] == "proj_abc"
             assert payload["sampling"]["steps"] == 10
@@ -543,7 +609,7 @@ def test_restore_audio_runs_full_flow_and_downloads(tmp_path, monkeypatch, trans
                 json={
                     "generationId": "gen_123",
                     "apiProjectId": "proj_abc",
-                    "modelKey": "diffio-4.5-flash",
+                    "modelKey": "diffio-4.6-flash",
                     "status": "queued",
                 },
             )
@@ -615,7 +681,7 @@ def test_restore_audio_runs_full_flow_and_downloads(tmp_path, monkeypatch, trans
     content, info = client.restore_audio(
         filePath=str(file_path),
         contentType="audio/wav",
-        model="diffio-4.5-flash",
+        model="diffio-4.6-flash",
         sampling={"steps": 10},
         pollInterval=0.0,
     )
@@ -916,7 +982,7 @@ def test_list_project_generations_payload_and_response():
                     {
                         "generationId": "gen_123",
                         "status": "processing",
-                        "modelKey": "diffio-4.5-flash",
+                        "modelKey": "diffio-4.6-flash",
                         "progress": None,
                         "createdAt": "2026-01-05T12:40:00Z",
                         "updatedAt": "2026-01-05T12:41:00Z",

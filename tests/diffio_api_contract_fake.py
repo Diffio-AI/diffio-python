@@ -11,7 +11,9 @@ FAKE_API_ORIGIN = "https://api.test"
 FAKE_EDGE_ORIGIN = "https://media.test"
 FAKE_EDGE_PART_SIZE_BYTES = 32 * 1024 * 1024
 FAKE_API_MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
-FAKE_SUPPORTED_MODEL_KEYS = ("diffio-4.5-flash", "diffio-4.5-pro")
+FAKE_SUPPORTED_MODEL_KEYS = ("diffio-4.6-flash", "diffio-4.6-pro")
+# The API still serves the 0.2.x generation paths as hidden aliases that run (and report) the 4.6 models.
+FAKE_ALIASED_MODEL_KEYS = {"diffio-4.5-flash": "diffio-4.6-flash", "diffio-4.5-pro": "diffio-4.6-pro"}
 FAKE_RESTORED_AUDIO_BYTES = b"ID3-restored-audio"
 
 
@@ -71,10 +73,11 @@ class FakeDiffioApiContract:
             return self._complete_project_upload(payload)
         if path.startswith("/v1/diffio-") and path.endswith("-generation"):
             model_key = path[len("/v1/"):-len("-generation")]
+            model_key = FAKE_ALIASED_MODEL_KEYS.get(model_key, model_key)
             if model_key not in FAKE_SUPPORTED_MODEL_KEYS:
                 return httpx.Response(410, json={
-                    "error": f"{model_key} has been retired. Use diffio-4.5-flash or diffio-4.5-pro "
-                             "(/v1/diffio-4.5-flash-generation or /v1/diffio-4.5-pro-generation).",
+                    "error": f"{model_key} has been retired. Use diffio-4.6-flash or diffio-4.6-pro "
+                             "(/v1/diffio-4.6-flash-generation or /v1/diffio-4.6-pro-generation).",
                     "code": "model_retired", "retiredModel": model_key,
                     "supportedModels": list(FAKE_SUPPORTED_MODEL_KEYS)})
             return self._create_generation(payload, model_key)
