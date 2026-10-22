@@ -54,9 +54,9 @@ projects = client.list_projects(
 
 ## Models
 
-Diffio 4.5 Flash (`diffio-4.5-flash`) and Diffio 4.5 Pro (`diffio-4.5-pro`) are the only
-models. `diffio-4.5-flash` is the default and works on every plan; `diffio-4.5-pro` needs a
-paid plan. Any other model id raises `ValueError` before a request is sent (the API answers
+Diffio 4.6 Flash (`diffio-4.6-flash`) and Diffio 4.6 Pro (`diffio-4.6-pro`) are the only
+models. `diffio-4.6-flash` is the default and works on every plan; `diffio-4.6-pro` needs a
+paid plan. Retired model ids raise `ValueError` before a request is sent (the API answers
 retired model endpoints with HTTP 410 and code `model_retired`). Existing generations created
 with older models keep their `modelKey` and can still be listed, polled, and downloaded.
 
@@ -88,7 +88,7 @@ project = client.create_project(
 
 generation = client.create_generation(
     apiProjectId=project.apiProjectId,
-    model="diffio-4.5-flash",
+    model="diffio-4.6-flash",
     idempotencyKey="restore-job-2026-001",
     requestOptions={"maxRetries": 2},
 )
@@ -109,7 +109,7 @@ from diffio import DiffioClient
 client = DiffioClient(apiKey="diffio_live_...")
 result = client.audio_isolation.isolate(
     filePath="sample.wav",
-    model="diffio-4.5-flash",
+    model="diffio-4.6-flash",
 )
 
 print(result.generation.generationId)
@@ -125,7 +125,7 @@ from diffio import DiffioClient
 client = DiffioClient(apiKey="diffio_live_...")
 audio_bytes, info = client.restore_audio(
     filePath="sample.wav",
-    model="diffio-4.5-flash",
+    model="diffio-4.6-flash",
     onProgress=lambda progress: print(progress.status),
 )
 
@@ -145,7 +145,7 @@ print(info["apiProjectId"], info["generationId"])
 restoration or final settlement is still pending; stage progress alone does not
 indicate overall completion.
 
-`complete` means restored media is ready. Diffio 4.5 transcribes the recording
+`complete` means restored media is ready. Diffio 4.6 transcribes the recording
 before restoration starts, so a completed generation has its transcript; while a
 generation runs, transcription can be `pending`, `available`, or `unavailable`.
 Read `progress.transcription.status` independently; `progress.transcription` is `None`
@@ -312,11 +312,17 @@ async def diffio_webhook(request: Request):
     return {"ok": True}
 ```
 
+## Upgrading to 0.3.0
+
+0.3.0 adds Diffio 4.6 Flash (`diffio-4.6-flash`) and Diffio 4.6 Pro (`diffio-4.6-pro`), and the
+default model is now `diffio-4.6-flash`. Request and response shapes are unchanged, and code
+written for 0.2.x runs without changes.
+
 ## Upgrading to 0.2.0
 
-0.2.0 follows the Diffio 4.5 API. It has breaking changes:
+0.2.0 followed the Diffio 4.5 API. It had breaking changes:
 
-* Only `diffio-4.5-flash` and `diffio-4.5-pro` are accepted, and the default model is
+* Only `diffio-4.5-flash` and `diffio-4.5-pro` were accepted, and the default model was
   `diffio-4.5-flash`. `diffio-2`, `diffio-2-flash`, `diffio-3.4`, `diffio-3.5`,
   `diffio-4.0-flash`, and `diffio-4.0-pro` were removed with no aliases.
 * `CreateProjectResponse` no longer has `uploadUrl`, `uploadMethod`, or `bucket`. It has

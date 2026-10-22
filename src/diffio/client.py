@@ -36,11 +36,16 @@ DEFAULT_BASE_URL = "https://api.diffio.ai"
 API_PREFIX = "v1"
 # Generation endpoint per model; the API answers every other model id with HTTP 410 model_retired.
 MODEL_ENDPOINTS = {
-    "diffio-4.5-flash": "diffio-4.5-flash-generation",
-    "diffio-4.5-pro": "diffio-4.5-pro-generation",
+    "diffio-4.6-flash": "diffio-4.6-flash-generation",
+    "diffio-4.6-pro": "diffio-4.6-pro-generation",
 }
-# Diffio 4.5 Flash is available on every plan; Diffio 4.5 Pro needs a paid plan.
-DEFAULT_MODEL_KEY = "diffio-4.5-flash"
+# Keys accepted from code written against 0.2.x; they run the matching 4.6 model. Not advertised.
+_LEGACY_MODEL_KEYS = {
+    "diffio-4.5-flash": "diffio-4.6-flash",
+    "diffio-4.5-pro": "diffio-4.6-pro",
+}
+# Diffio 4.6 Flash is available on every plan; Diffio 4.6 Pro needs a paid plan.
+DEFAULT_MODEL_KEY = "diffio-4.6-flash"
 DEFAULT_RETRY_STATUS_CODES = [408, 429, 500, 502, 503, 504]
 DEFAULT_RETRY_BACKOFF = 0.5
 
@@ -426,11 +431,11 @@ class DiffioClient:
         requestOptions=None,
     ):
         """Create a generation; automatic retries require a supplied idempotency key."""
-        endpoint = MODEL_ENDPOINTS.get(model)
+        endpoint = MODEL_ENDPOINTS.get(_LEGACY_MODEL_KEYS.get(model, model))
         if not endpoint:
             raise ValueError(
-                f"Unsupported model: {model}. Diffio 4.5 Flash and Diffio 4.5 Pro are the only models;"
-                " use diffio-4.5-flash or diffio-4.5-pro."
+                f"Unsupported model: {model}. Diffio 4.6 Flash and Diffio 4.6 Pro are the only models;"
+                " use diffio-4.6-flash or diffio-4.6-pro."
             )
 
         payload = {"apiProjectId": apiProjectId}
@@ -566,7 +571,7 @@ class DiffioClient:
         """
         Polls generation progress until completion or failure.
 
-        Completion means restored media is ready. Diffio 4.5 transcribes the
+        Completion means restored media is ready. Diffio 4.6 transcribes the
         recording before restoration; read progress.transcription for the
         transcript state while a generation runs.
 

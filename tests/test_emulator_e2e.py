@@ -161,7 +161,7 @@ def test_emulator_create_generation_appears_in_list(client: DiffioClient, sample
     project = client.create_project(filePath=str(sample_audio_path))
     generation = client.create_generation(
         apiProjectId=project.apiProjectId,
-        model="diffio-4.5-flash",
+        model="diffio-4.6-flash",
     )
 
     generations = client.list_project_generations(apiProjectId=project.apiProjectId)
@@ -176,7 +176,7 @@ def test_emulator_audio_isolation_full_flow_download(
     result = client.audio_isolation.isolate(
         filePath=str(sample_audio_path),
         contentType="audio/mpeg",
-        model="diffio-4.5-flash",
+        model="diffio-4.6-flash",
     )
 
     progress = _wait_for_generation_complete(

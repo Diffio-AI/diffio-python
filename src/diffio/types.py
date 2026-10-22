@@ -513,7 +513,7 @@ class AudioIsolationResult:
 
 
 # Models the API accepts; every other model id is retired and answered with HTTP 410 model_retired.
-ModelKey = ("diffio-4.5-flash", "diffio-4.5-pro")
+ModelKey = ("diffio-4.6-flash", "diffio-4.6-pro")
 DownloadType = ("audio", "mp3", "video", "transcript")
 WebhookMode = ("test", "live")
 WebhookEventType = (
