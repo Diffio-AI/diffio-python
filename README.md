@@ -163,7 +163,8 @@ empty until the transcript is ready. Each item is a `GenerationWarning` with `co
 and a readable `message`. `code == "unsupported_language"` means the transcript has speech in
 `languages` (ISO 639-1 codes such as `ja`, most words first) that Diffio does not support yet,
 so the result probably won't be usable. Generation webhooks carry the same warnings as
-`event.warnings` (an empty list when the payload has none).
+`event.warnings` (an empty list when the payload has none), and a `generation.failed` webhook
+carries the same `retryable` as `event.retryable` (`None` when the payload does not include it).
 
 When a generation fails, `progress.retryable` is `True` if a new generation for the same project
 can fix it (for example, transcription that did not succeed after its automatic retries) and
@@ -337,7 +338,7 @@ async def diffio_webhook(request: Request):
 0.4.0 adds Diffio 4.7 Flash (`diffio-4.7-flash`) and Diffio 4.7 Pro (`diffio-4.7-pro`), and the
 default model is now `diffio-4.7-flash`. Older model names still work and run Diffio 4.7, but
 they are deprecated and emit a `DeprecationWarning`. Generation progress adds `warnings` and
-`retryable`, and generation webhook events add `warnings`. Code written for 0.3.x runs without
+`retryable`, and generation webhook events add `warnings` and `retryable`. Code written for 0.3.x runs without
 changes.
 
 ## Upgrading to 0.3.0
