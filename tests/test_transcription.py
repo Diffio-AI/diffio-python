@@ -215,6 +215,15 @@ def test_webhook_without_warnings_defaults_to_empty_list():
     assert event.warnings == []
 
 
+def test_webhook_retryable_is_none_unless_a_failed_event_carries_it():
+    assert GenerationWebhookEvent.from_dict(_webhook_payload()).retryable is None
+    failed = GenerationWebhookEvent.from_dict(_webhook_payload(
+        eventType="generation.failed", status="error", error="Transcription failed.", retryable=True,
+    ))
+    assert failed.retryable is True
+    assert GenerationWebhookEvent.from_dict(_webhook_payload(retryable=False)).retryable is False
+
+
 def test_verified_webhook_parses_warnings():
     body, headers, secret = _signed_webhook(_webhook_payload(warnings=[UNSUPPORTED_LANGUAGE_WARNING]))
 

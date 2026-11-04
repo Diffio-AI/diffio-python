@@ -513,6 +513,7 @@ class GenerationWebhookEvent:
         errorDetails,
         transcription=None,
         warnings=None,
+        retryable=None,
     ):
         self.eventType = eventType
         self.eventId = eventId
@@ -528,10 +529,14 @@ class GenerationWebhookEvent:
         self.transcription = transcription
         # Webhooks carry warnings only when there are some; empty otherwise.
         self.warnings = list(warnings) if warnings else []
+        # generation.failed events say whether a new generation for the same project can fix the failure;
+        # None when the payload does not include it.
+        self.retryable = retryable
 
     @classmethod
     def from_dict(cls, data):
         transcription = data.get("transcription")
+        retryable = data.get("retryable")
         return cls(
             eventType=data["eventType"],
             eventId=data["eventId"],
@@ -549,6 +554,7 @@ class GenerationWebhookEvent:
                 if transcription is not None else None
             ),
             warnings=_parse_generation_warnings(data.get("warnings")),
+            retryable=bool(retryable) if retryable is not None else None,
         )
 
 
