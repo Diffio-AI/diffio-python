@@ -236,6 +236,39 @@ class GenerationTranscription:
         return cls(status=data["status"])
 
 
+class GenerationWarning:
+    """Something to know about a generation's recording; the generation still runs.
+
+    code unsupported_language means the transcript has speech in languages (ISO 639-1 base codes,
+    most words first) that Diffio does not support yet, so the result probably won't be usable.
+    """
+
+    def __init__(self, code, languages, message):
+        self.code = code
+        self.languages = languages
+        self.message = message
+
+    @classmethod
+    def from_dict(cls, data):
+        languages = data.get("languages")
+        if not isinstance(languages, list):
+            languages = []
+        return cls(
+            code=data.get("code"),
+            languages=[str(language) for language in languages if language],
+            message=data.get("message"),
+        )
+
+    def __repr__(self):
+        return f"GenerationWarning(code={self.code!r}, languages={self.languages!r})"
+
+
+def _parse_generation_warnings(value):
+    if not isinstance(value, list):
+        return []
+    return [GenerationWarning.from_dict(item) for item in value if isinstance(item, dict)]
+
+
 class GenerationProgressResponse:
     def __init__(
         self,
@@ -252,6 +285,8 @@ class GenerationProgressResponse:
         stage=None,
         stageProgress=None,
         queue=None,
+        warnings=None,
+        retryable=None,
     ):
         self.generationId = generationId
         self.apiProjectId = apiProjectId
@@ -266,10 +301,15 @@ class GenerationProgressResponse:
         self.stage = stage
         self.stageProgress = stageProgress
         self.queue = queue
+        # Empty until the transcript is ready; GenerationWarning objects after that.
+        self.warnings = list(warnings) if warnings else []
+        # True when the failure is one a new generation for the same project can retry; None without an error.
+        self.retryable = retryable
 
     @classmethod
     def from_dict(cls, data):
         restored_video = data.get("restoredVideo")
+        retryable = data.get("retryable")
         transcription = data.get("transcription")
         return cls(
             generationId=data["generationId"],
@@ -288,6 +328,8 @@ class GenerationProgressResponse:
             stage=data.get("stage"),
             stageProgress=data.get("stageProgress") if isinstance(data.get("stageProgress"), dict) else None,
             queue=data.get("queue") if isinstance(data.get("queue"), dict) else None,
+            warnings=_parse_generation_warnings(data.get("warnings")),
+            retryable=bool(retryable) if retryable is not None else None,
         )
 
 
@@ -470,6 +512,7 @@ class GenerationWebhookEvent:
         error,
         errorDetails,
         transcription=None,
+        warnings=None,
     ):
         self.eventType = eventType
         self.eventId = eventId
@@ -483,6 +526,8 @@ class GenerationWebhookEvent:
         self.error = error
         self.errorDetails = errorDetails
         self.transcription = transcription
+        # Webhooks carry warnings only when there are some; empty otherwise.
+        self.warnings = list(warnings) if warnings else []
 
     @classmethod
     def from_dict(cls, data):
@@ -503,6 +548,7 @@ class GenerationWebhookEvent:
                 GenerationTranscription.from_dict(transcription)
                 if transcription is not None else None
             ),
+            warnings=_parse_generation_warnings(data.get("warnings")),
         )
 
 
@@ -513,7 +559,7 @@ class AudioIsolationResult:
 
 
 # Models the API accepts; every other model id is retired and answered with HTTP 410 model_retired.
-ModelKey = ("diffio-4.6-flash", "diffio-4.6-pro")
+ModelKey = ("diffio-4.7-flash", "diffio-4.7-pro")
 DownloadType = ("audio", "mp3", "video", "transcript")
 WebhookMode = ("test", "live")
 WebhookEventType = (
@@ -524,3 +570,4 @@ WebhookEventType = (
 )
 GenerationWebhookStatus = ("queued", "processing", "error", "complete")
 TranscriptionStatus = ("pending", "available", "unavailable")
+GenerationWarningCode = ("unsupported_language",)
