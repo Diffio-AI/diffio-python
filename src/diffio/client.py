@@ -1,6 +1,7 @@
 import json
 import mimetypes
 import os
+import sys
 import tempfile
 import time
 import warnings
@@ -36,16 +37,19 @@ DEFAULT_BASE_URL = "https://api.diffio.ai"
 API_PREFIX = "v1"
 # Generation endpoint per model; the API answers every other model id with HTTP 410 model_retired.
 MODEL_ENDPOINTS = {
-    "diffio-4.6-flash": "diffio-4.6-flash-generation",
-    "diffio-4.6-pro": "diffio-4.6-pro-generation",
+    "diffio-4.7-flash": "diffio-4.7-flash-generation",
+    "diffio-4.7-pro": "diffio-4.7-pro-generation",
 }
-# Keys accepted from code written against 0.2.x; they run the matching 4.6 model. Not advertised.
-_LEGACY_MODEL_KEYS = {
-    "diffio-4.5-flash": "diffio-4.6-flash",
-    "diffio-4.5-pro": "diffio-4.6-pro",
+# Deprecated keys from code written against 0.2.x and 0.3.x; they run the matching 4.7 model and emit a
+# DeprecationWarning. Not advertised.
+_DEPRECATED_MODEL_KEYS = {
+    "diffio-4.6-flash": "diffio-4.7-flash",
+    "diffio-4.6-pro": "diffio-4.7-pro",
+    "diffio-4.5-flash": "diffio-4.7-flash",
+    "diffio-4.5-pro": "diffio-4.7-pro",
 }
-# Diffio 4.6 Flash is available on every plan; Diffio 4.6 Pro needs a paid plan.
-DEFAULT_MODEL_KEY = "diffio-4.6-flash"
+# Diffio 4.7 Flash is available on every plan; Diffio 4.7 Pro needs a paid plan.
+DEFAULT_MODEL_KEY = "diffio-4.7-flash"
 DEFAULT_RETRY_STATUS_CODES = [408, 429, 500, 502, 503, 504]
 DEFAULT_RETRY_BACKOFF = 0.5
 
@@ -431,12 +435,7 @@ class DiffioClient:
         requestOptions=None,
     ):
         """Create a generation; automatic retries require a supplied idempotency key."""
-        endpoint = MODEL_ENDPOINTS.get(_LEGACY_MODEL_KEYS.get(model, model))
-        if not endpoint:
-            raise ValueError(
-                f"Unsupported model: {model}. Diffio 4.6 Flash and Diffio 4.6 Pro are the only models;"
-                " use diffio-4.6-flash or diffio-4.6-pro."
-            )
+        endpoint = MODEL_ENDPOINTS[_resolve_model_key(model)]
 
         payload = {"apiProjectId": apiProjectId}
         if sampling is not None:
@@ -571,9 +570,13 @@ class DiffioClient:
         """
         Polls generation progress until completion or failure.
 
-        Completion means restored media is ready. Diffio 4.6 transcribes the
+        Completion means restored media is ready. Diffio 4.7 transcribes the
         recording before restoration; read progress.transcription for the
-        transcript state while a generation runs.
+        transcript state and progress.warnings for things to know about the
+        recording (for example unsupported_language) while a generation runs.
+        A failed generation raises RuntimeError; read progress.retryable from
+        get_generation_progress to learn whether a new generation for the same
+        project can retry it.
 
         Parameters
         ----------
@@ -1250,6 +1253,7 @@ class AudioIsolationClient:
         generationParams=None,
         requestOptions=None,
     ):
+        model = _resolve_model_key(model)
         project = self._parent.create_project(
             filePath=filePath,
             contentType=contentType,
@@ -1348,6 +1352,8 @@ class AudioIsolationClient:
             if progress is not None:
                 metadata["error"] = progress.error or str(exc)
                 metadata["errorDetails"] = progress.errorDetails
+                metadata["retryable"] = progress.retryable
+                metadata["warnings"] = progress.warnings
             if raiseOnError:
                 _attach_restore_metadata(exc, metadata)
                 raise
@@ -1357,6 +1363,8 @@ class AudioIsolationClient:
         metadata["status"] = progress.status
         metadata["error"] = progress.error
         metadata["errorDetails"] = progress.errorDetails
+        metadata["retryable"] = progress.retryable
+        metadata["warnings"] = progress.warnings
 
         metadata["stage"] = "download_info"
         try:
@@ -1434,6 +1442,37 @@ class AudioIsolationClient:
             raiseOnError=raiseOnError,
         )
 
+
+
+def _resolve_model_key(model):
+    """Return the Diffio 4.7 model key for model, warning on deprecated keys and rejecting unknown ones."""
+    if model in MODEL_ENDPOINTS:
+        return model
+    replacement = _DEPRECATED_MODEL_KEYS.get(model)
+    if replacement is None:
+        raise ValueError(
+            f"Unsupported model: {model}. Diffio 4.7 Flash and Diffio 4.7 Pro are the only models;"
+            " use diffio-4.7-flash or diffio-4.7-pro."
+        )
+    warnings.warn(
+        f"Model {model} is deprecated and now runs Diffio 4.7; use {replacement} instead.",
+        DeprecationWarning,
+        stacklevel=_caller_stacklevel(),
+    )
+    return replacement
+
+
+def _caller_stacklevel():
+    """Stack level of the first frame outside this package, so warnings point at the SDK caller."""
+    package_dir = os.path.dirname(os.path.abspath(__file__))
+    frame = sys._getframe(1)
+    level = 1
+    while frame is not None:
+        if os.path.dirname(os.path.abspath(frame.f_code.co_filename)) != package_dir:
+            return level
+        frame = frame.f_back
+        level += 1
+    return level
 
 
 def _guess_content_type(file_path):
@@ -1646,6 +1685,8 @@ def _init_restore_metadata():
         "status": None,
         "error": None,
         "errorDetails": None,
+        "retryable": None,
+        "warnings": [],
         "exceptionType": None,
         "exceptionMessage": None,
         "statusCode": None,

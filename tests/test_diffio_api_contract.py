@@ -142,7 +142,7 @@ def test_create_project_refuses_file_larger_than_session_limit(tmp_path):
     assert _edge_upload_requests(fake) == []
 
 
-def test_create_generation_defaults_to_diffio_4_6_flash(tmp_path):
+def test_create_generation_defaults_to_diffio_4_7_flash(tmp_path):
     fake = FakeDiffioApiContract()
     audio_path = tmp_path / "sample.mp3"
     audio_path.write_bytes(b"ID3")
@@ -150,33 +150,54 @@ def test_create_generation_defaults_to_diffio_4_6_flash(tmp_path):
     project = client.create_project(filePath=str(audio_path))
 
     generation = client.create_generation(apiProjectId=project.apiProjectId)
-    pro_generation = client.generations.create(apiProjectId=project.apiProjectId, model="diffio-4.6-pro")
+    pro_generation = client.generations.create(apiProjectId=project.apiProjectId, model="diffio-4.7-pro")
 
-    assert generation.modelKey == "diffio-4.6-flash"
-    assert pro_generation.modelKey == "diffio-4.6-pro"
-    assert len(fake.requests_for_path("/v1/diffio-4.6-flash-generation")) == 1
-    assert len(fake.requests_for_path("/v1/diffio-4.6-pro-generation")) == 1
+    assert generation.modelKey == "diffio-4.7-flash"
+    assert pro_generation.modelKey == "diffio-4.7-pro"
+    assert len(fake.requests_for_path("/v1/diffio-4.7-flash-generation")) == 1
+    assert len(fake.requests_for_path("/v1/diffio-4.7-pro-generation")) == 1
 
 
 @pytest.mark.parametrize("legacyModel, expectedModel", [
-    ("diffio-4.5-flash", "diffio-4.6-flash"),
-    ("diffio-4.5-pro", "diffio-4.6-pro"),
+    ("diffio-4.6-flash", "diffio-4.7-flash"),
+    ("diffio-4.6-pro", "diffio-4.7-pro"),
+    ("diffio-4.5-flash", "diffio-4.7-flash"),
+    ("diffio-4.5-pro", "diffio-4.7-pro"),
 ])
-def test_create_generation_runs_0_2_model_keys_on_4_6(tmp_path, legacyModel, expectedModel):
+def test_create_generation_runs_deprecated_model_keys_on_4_7(tmp_path, legacyModel, expectedModel):
     fake = FakeDiffioApiContract()
     audio_path = tmp_path / "sample.mp3"
     audio_path.write_bytes(b"ID3")
     client = _build_contract_client(fake)
     project = client.create_project(filePath=str(audio_path))
 
-    generation = client.create_generation(apiProjectId=project.apiProjectId, model=legacyModel)
+    with pytest.warns(DeprecationWarning, match=f"{legacyModel} is deprecated"):
+        generation = client.create_generation(apiProjectId=project.apiProjectId, model=legacyModel)
 
     assert generation.modelKey == expectedModel
     assert len(fake.requests_for_path(f"/v1/{expectedModel}-generation")) == 1
     assert fake.requests_for_path(f"/v1/{legacyModel}-generation") == []
 
 
-def test_fake_api_answers_retired_model_endpoint_with_4_6_guidance():
+@pytest.mark.parametrize("aliasModel, expectedModel", [
+    ("diffio-4.6-flash", "diffio-4.7-flash"),
+    ("diffio-4.5-pro", "diffio-4.7-pro"),
+])
+def test_fake_api_serves_old_generation_paths_as_4_7(tmp_path, aliasModel, expectedModel):
+    fake = FakeDiffioApiContract()
+    audio_path = tmp_path / "sample.mp3"
+    audio_path.write_bytes(b"ID3")
+    project = _build_contract_client(fake).create_project(filePath=str(audio_path))
+
+    response = fake.build_http_client().post(f"/v1/{aliasModel}-generation",
+                                             json={"apiProjectId": project.apiProjectId},
+                                             headers={"Authorization": f"Bearer {fake.apiKey}"})
+
+    assert response.status_code == 200
+    assert response.json()["modelKey"] == expectedModel
+
+
+def test_fake_api_answers_retired_model_endpoint_with_4_7_guidance():
     fake = FakeDiffioApiContract()
     http_client = fake.build_http_client()
 
@@ -185,11 +206,11 @@ def test_fake_api_answers_retired_model_endpoint_with_4_6_guidance():
 
     assert response.status_code == 410
     assert response.json() == {
-        "error": "diffio-4.0-pro has been retired. Use diffio-4.6-flash or diffio-4.6-pro "
-                 "(/v1/diffio-4.6-flash-generation or /v1/diffio-4.6-pro-generation).",
+        "error": "diffio-4.0-pro has been retired. Use diffio-4.7-flash or diffio-4.7-pro "
+                 "(/v1/diffio-4.7-flash-generation or /v1/diffio-4.7-pro-generation).",
         "code": "model_retired",
         "retiredModel": "diffio-4.0-pro",
-        "supportedModels": ["diffio-4.6-flash", "diffio-4.6-pro"],
+        "supportedModels": ["diffio-4.7-flash", "diffio-4.7-pro"],
     }
 
 
@@ -200,15 +221,72 @@ def test_create_generation_rejects_retired_model_before_sending(retiredModel):
     fake = FakeDiffioApiContract()
     client = _build_contract_client(fake)
 
-    with pytest.raises(ValueError, match="diffio-4.6-flash"):
+    with pytest.raises(ValueError, match="diffio-4.7-flash"):
         client.create_generation(apiProjectId="proj", model=retiredModel)
 
     assert fake.requests == []
 
 
+def test_audio_isolation_rejects_retired_model_before_uploading(tmp_path):
+    fake = FakeDiffioApiContract()
+    audio_path = tmp_path / "sample.mp3"
+    audio_path.write_bytes(b"ID3")
+    client = _build_contract_client(fake)
+
+    with pytest.raises(ValueError, match="diffio-4.7-flash"):
+        client.audio_isolation.isolate(filePath=str(audio_path), model="diffio-4.0-pro")
+
+    assert fake.requests == []
+
+
+def test_get_generation_progress_reports_empty_warnings_and_no_retryable(tmp_path):
+    fake = FakeDiffioApiContract()
+    fake.generations["gen-1"] = {"apiProjectId": "proj-1", "modelKey": "diffio-4.7-flash"}
+    client = _build_contract_client(fake)
+
+    progress = client.get_generation_progress(generationId="gen-1", apiProjectId="proj-1")
+
+    assert progress.status == "complete"
+    assert progress.warnings == []
+    assert progress.retryable is None
+
+
+def test_get_generation_progress_parses_unsupported_language_warning():
+    fake = FakeDiffioApiContract()
+    fake.generations["gen-1"] = {"apiProjectId": "proj-1", "modelKey": "diffio-4.7-flash",
+                                 "unsupportedLanguages": ["ja", "ko"]}
+    client = _build_contract_client(fake)
+
+    progress = client.generations.get_progress(generationId="gen-1", apiProjectId="proj-1")
+
+    assert len(progress.warnings) == 1
+    warning = progress.warnings[0]
+    assert warning.code == "unsupported_language"
+    assert warning.languages == ["ja", "ko"]
+    assert warning.message == ("This recording contains speech in a language Diffio doesn't support yet "
+                               "(ja, ko). The result probably won't be usable.")
+
+
+@pytest.mark.parametrize("errorCode, expectedRetryable", [
+    ("TRANSCRIPTION_FAILED", True),
+    ("NO_SPEECH_DETECTED", False),
+])
+def test_failed_generation_progress_reports_retryable(errorCode, expectedRetryable):
+    fake = FakeDiffioApiContract()
+    fake.generations["gen-1"] = {"apiProjectId": "proj-1", "modelKey": "diffio-4.7-flash",
+                                 "errorCode": errorCode, "error": "Generation failed."}
+    client = _build_contract_client(fake)
+
+    progress = client.get_generation_progress(generationId="gen-1", apiProjectId="proj-1")
+
+    assert progress.status == "failed"
+    assert progress.error == "Generation failed."
+    assert progress.retryable is expectedRetryable
+
+
 def test_get_generation_download_parses_edge_media_response(tmp_path):
     fake = FakeDiffioApiContract()
-    fake.generations["gen-1"] = {"apiProjectId": "proj-1", "modelKey": "diffio-4.6-flash"}
+    fake.generations["gen-1"] = {"apiProjectId": "proj-1", "modelKey": "diffio-4.7-flash"}
     client = _build_contract_client(fake)
 
     download = client.get_generation_download(generationId="gen-1", apiProjectId="proj-1")
@@ -235,5 +313,7 @@ def test_restore_audio_runs_against_current_api_contract(tmp_path):
     assert info["error"] is None
     assert info["ok"] is True
     assert content == FAKE_RESTORED_AUDIO_BYTES
-    assert info["generation"].modelKey == "diffio-4.6-flash"
+    assert info["generation"].modelKey == "diffio-4.7-flash"
+    assert info["warnings"] == []
+    assert info["retryable"] is None
     assert read_stored_upload_bytes(fake, info["apiProjectId"]) == b"ID3-sample-audio"

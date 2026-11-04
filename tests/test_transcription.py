@@ -7,7 +7,16 @@ import httpx
 import pytest
 from svix.webhooks import Webhook
 
-from diffio import DiffioApiError, DiffioClient, GenerationTranscription, TranscriptionStatus
+from diffio import (
+    DiffioApiError,
+    DiffioClient,
+    GenerationProgressResponse,
+    GenerationTranscription,
+    GenerationWarning,
+    GenerationWarningCode,
+    GenerationWebhookEvent,
+    TranscriptionStatus,
+)
 
 
 def completed_progress(transcription_status):
@@ -90,6 +99,132 @@ def test_verified_webhook_preserves_transcription_state(transcription_status):
     else:
         assert isinstance(event.transcription, GenerationTranscription)
         assert event.transcription.status == transcription_status
+
+
+UNSUPPORTED_LANGUAGE_WARNING = {
+    "code": "unsupported_language",
+    "languages": ["ja", "ko"],
+    "message": "This recording contains speech in a language Diffio doesn't support yet (ja, ko)."
+               " The result probably won't be usable.",
+}
+
+
+def _signed_webhook(payload):
+    body = json.dumps(payload)
+    secret = "whsec_" + base64.b64encode(b"test-webhook-secret").decode("ascii")
+    timestamp = datetime.now(timezone.utc)
+    headers = {
+        "svix-id": "msg_123",
+        "svix-timestamp": str(int(timestamp.timestamp())),
+        "svix-signature": Webhook(secret).sign("msg_123", timestamp, body),
+    }
+    return body.encode("utf-8"), headers, secret
+
+
+def _webhook_payload(**fields):
+    payload = {
+        "eventType": "generation.completed",
+        "eventId": "evt_123",
+        "createdAt": "2026-11-04T00:00:00Z",
+        "apiKeyId": "key_123",
+        "apiProjectId": "proj_123",
+        "generationId": "gen_123",
+        "status": "complete",
+        "modelKey": "diffio-4.7-flash",
+        "hasVideo": False,
+        "error": None,
+        "errorDetails": None,
+    }
+    payload.update(fields)
+    return payload
+
+
+def test_progress_without_warnings_or_error_defaults_to_empty_warnings_and_no_retryable():
+    progress = GenerationProgressResponse.from_dict(completed_progress("pending"))
+
+    assert progress.warnings == []
+    assert progress.retryable is None
+
+
+def test_progress_parses_unsupported_language_warnings():
+    payload = completed_progress("available")
+    payload["warnings"] = [UNSUPPORTED_LANGUAGE_WARNING, "not-a-warning"]
+
+    progress = GenerationProgressResponse.from_dict(payload)
+
+    assert len(progress.warnings) == 1
+    warning = progress.warnings[0]
+    assert isinstance(warning, GenerationWarning)
+    assert warning.code == "unsupported_language"
+    assert warning.code in GenerationWarningCode
+    assert warning.languages == ["ja", "ko"]
+    assert warning.message == UNSUPPORTED_LANGUAGE_WARNING["message"]
+
+
+def test_progress_tolerates_malformed_warnings():
+    payload = completed_progress("available")
+    payload["warnings"] = None
+
+    assert GenerationProgressResponse.from_dict(payload).warnings == []
+
+
+@pytest.mark.parametrize("retryable", [True, False])
+def test_failed_progress_parses_retryable(retryable):
+    payload = completed_progress("unavailable")
+    payload.update({"status": "failed", "error": "We couldn't transcribe this file. Please try again.",
+                    "errorDetails": None, "retryable": retryable, "warnings": []})
+
+    progress = GenerationProgressResponse.from_dict(payload)
+
+    assert progress.status == "failed"
+    assert progress.retryable is retryable
+
+
+def test_restore_audio_failure_reports_retryable_and_warnings(tmp_path):
+    from diffio_api_contract_fake import FakeDiffioApiContract
+
+    class FailingTranscriptionFake(FakeDiffioApiContract):
+        def _create_generation(self, payload, model_key):
+            response = super()._create_generation(payload, model_key)
+            generation_id = json.loads(response.content)["generationId"]
+            self.generations[generation_id].update({
+                "errorCode": "TRANSCRIPTION_FAILED",
+                "error": "We couldn't transcribe this file. Please try again.",
+                "unsupportedLanguages": ["ja"],
+            })
+            return response
+
+    fake = FailingTranscriptionFake()
+    audio_path = tmp_path / "sample.mp3"
+    audio_path.write_bytes(b"ID3")
+    client = DiffioClient(apiKey=fake.apiKey, httpClient=fake.build_http_client())
+
+    content, info = client.restore_audio(filePath=str(audio_path), pollInterval=0)
+
+    assert content is None
+    assert info["ok"] is False
+    assert info["stage"] == "progress"
+    assert info["error"] == "We couldn't transcribe this file. Please try again."
+    assert info["retryable"] is True
+    assert [warning.languages for warning in info["warnings"]] == [["ja"]]
+
+
+def test_webhook_without_warnings_defaults_to_empty_list():
+    event = GenerationWebhookEvent.from_dict(_webhook_payload())
+
+    assert event.warnings == []
+
+
+def test_verified_webhook_parses_warnings():
+    body, headers, secret = _signed_webhook(_webhook_payload(warnings=[UNSUPPORTED_LANGUAGE_WARNING]))
+
+    with DiffioClient(apiKey="diffio_test") as client:
+        event = client.webhooks.verify_signature(payload=body, headers=headers, secret=secret)
+
+    assert [(warning.code, warning.languages) for warning in event.warnings] == [
+        ("unsupported_language", ["ja", "ko"]),
+    ]
+    assert event.warnings[0].message == UNSUPPORTED_LANGUAGE_WARNING["message"]
 
 
 @pytest.fixture(params=[

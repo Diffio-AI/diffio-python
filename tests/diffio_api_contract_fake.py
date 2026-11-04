@@ -5,15 +5,21 @@ from urllib.parse import parse_qs, unquote
 
 import httpx
 
-# Mirrors diffio-ui api/api_projects.py, api/api_generations.py, api/api_model_retirement.py and the
+# Mirrors diffio-ui api/api_projects.py, api/api_generations.py, api/api_model_retirement.py,
+# api/api_transcription.py (generation warnings) and the
 # edge Worker upload and media routes (edge/src/uploadRoutes.ts, specs/MacFleetArchitecture.md).
 FAKE_API_ORIGIN = "https://api.test"
 FAKE_EDGE_ORIGIN = "https://media.test"
 FAKE_EDGE_PART_SIZE_BYTES = 32 * 1024 * 1024
 FAKE_API_MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
-FAKE_SUPPORTED_MODEL_KEYS = ("diffio-4.6-flash", "diffio-4.6-pro")
-# The API still serves the 0.2.x generation paths as hidden aliases that run (and report) the 4.6 models.
-FAKE_ALIASED_MODEL_KEYS = {"diffio-4.5-flash": "diffio-4.6-flash", "diffio-4.5-pro": "diffio-4.6-pro"}
+FAKE_SUPPORTED_MODEL_KEYS = ("diffio-4.7-flash", "diffio-4.7-pro")
+# The API still serves the 4.6 and 4.5 generation paths as hidden aliases that run (and report) the 4.7 models.
+FAKE_ALIASED_MODEL_KEYS = {
+    "diffio-4.6-flash": "diffio-4.7-flash", "diffio-4.6-pro": "diffio-4.7-pro",
+    "diffio-4.5-flash": "diffio-4.7-flash", "diffio-4.5-pro": "diffio-4.7-pro",
+}
+# Generation errorCode values a new generation for the same project can retry (API_RETRYABLE_GENERATION_ERROR_CODES).
+FAKE_RETRYABLE_ERROR_CODES = frozenset({"TRANSCRIPTION_FAILED"})
 FAKE_RESTORED_AUDIO_BYTES = b"ID3-restored-audio"
 
 
@@ -76,8 +82,8 @@ class FakeDiffioApiContract:
             model_key = FAKE_ALIASED_MODEL_KEYS.get(model_key, model_key)
             if model_key not in FAKE_SUPPORTED_MODEL_KEYS:
                 return httpx.Response(410, json={
-                    "error": f"{model_key} has been retired. Use diffio-4.6-flash or diffio-4.6-pro "
-                             "(/v1/diffio-4.6-flash-generation or /v1/diffio-4.6-pro-generation).",
+                    "error": f"{model_key} has been retired. Use diffio-4.7-flash or diffio-4.7-pro "
+                             "(/v1/diffio-4.7-flash-generation or /v1/diffio-4.7-pro-generation).",
                     "code": "model_retired", "retiredModel": model_key,
                     "supportedModels": list(FAKE_SUPPORTED_MODEL_KEYS)})
             return self._create_generation(payload, model_key)
@@ -156,18 +162,26 @@ class FakeDiffioApiContract:
         generation = self.generations.get(generation_id)
         if generation is None:
             return httpx.Response(404, json={"error": "Generation not found."})
+        error_code = generation.get("errorCode")
+        status = "failed" if error_code else "complete"
         stage = {"jobId": None, "jobState": None, "status": "complete", "progress": 100,
                  "statusMessage": None, "error": None, "errorDetails": None}
-        return httpx.Response(200, json={
+        response = {
             "generationId": generation_id,
             "apiProjectId": generation["apiProjectId"],
-            "status": "complete",
+            "status": status,
             "hasVideo": False,
             "preProcessing": stage,
             "inference": dict(stage),
-            "stage": "complete",
-            "transcription": {"status": "available"},
-        })
+            "stage": status,
+        }
+        if error_code:
+            response["error"] = generation.get("error") or "Generation failed."
+            response["errorDetails"] = generation.get("errorDetails")
+            response["retryable"] = error_code in FAKE_RETRYABLE_ERROR_CODES
+        response["transcription"] = {"status": "unavailable" if error_code else "available"}
+        response["warnings"] = fake_generation_warnings(generation)
+        return httpx.Response(200, json=response)
 
     def _get_generation_download(self, payload):
         generation_id = payload.get("generationId")
@@ -271,3 +285,14 @@ def read_stored_upload_bytes(fake, apiProjectId):
     """Return the bytes the fake edge stored for a project's original upload, or None."""
     project = fake.projects[apiProjectId]
     return fake.storedObjects.get(unquote(project["storagePath"]))
+
+
+def fake_generation_warnings(generation):
+    """Mirror of resolve_api_generation_warnings: one unsupported_language warning from unsupportedLanguages."""
+    raw = generation.get("unsupportedLanguages")
+    languages = [code for code in raw if isinstance(code, str) and code] if isinstance(raw, list) else []
+    if not languages:
+        return []
+    return [{"code": "unsupported_language", "languages": languages,
+             "message": ("This recording contains speech in a language Diffio doesn't support yet "
+                         f"({', '.join(languages)}). The result probably won't be usable.")}]

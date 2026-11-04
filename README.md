@@ -54,11 +54,13 @@ projects = client.list_projects(
 
 ## Models
 
-Diffio 4.6 Flash (`diffio-4.6-flash`) and Diffio 4.6 Pro (`diffio-4.6-pro`) are the only
-models. `diffio-4.6-flash` is the default and works on every plan; `diffio-4.6-pro` needs a
-paid plan. Retired model ids raise `ValueError` before a request is sent (the API answers
-retired model endpoints with HTTP 410 and code `model_retired`). Existing generations created
-with older models keep their `modelKey` and can still be listed, polled, and downloaded.
+Diffio 4.7 Flash (`diffio-4.7-flash`) and Diffio 4.7 Pro (`diffio-4.7-pro`) are the only
+models. `diffio-4.7-flash` is the default and works on every plan; `diffio-4.7-pro` needs a
+paid plan. Older model names from earlier SDK releases still work and run Diffio 4.7, but they
+are deprecated and emit a `DeprecationWarning`. Retired model ids raise `ValueError` before a
+request is sent (the API answers retired model endpoints with HTTP 410 and code `model_retired`).
+Existing generations created with older models keep their `modelKey` and can still be listed,
+polled, and downloaded.
 
 ## Create a project and generation
 
@@ -88,7 +90,7 @@ project = client.create_project(
 
 generation = client.create_generation(
     apiProjectId=project.apiProjectId,
-    model="diffio-4.6-flash",
+    model="diffio-4.7-flash",
     idempotencyKey="restore-job-2026-001",
     requestOptions={"maxRetries": 2},
 )
@@ -109,7 +111,7 @@ from diffio import DiffioClient
 client = DiffioClient(apiKey="diffio_live_...")
 result = client.audio_isolation.isolate(
     filePath="sample.wav",
-    model="diffio-4.6-flash",
+    model="diffio-4.7-flash",
 )
 
 print(result.generation.generationId)
@@ -125,7 +127,7 @@ from diffio import DiffioClient
 client = DiffioClient(apiKey="diffio_live_...")
 audio_bytes, info = client.restore_audio(
     filePath="sample.wav",
-    model="diffio-4.6-flash",
+    model="diffio-4.7-flash",
     onProgress=lambda progress: print(progress.status),
 )
 
@@ -145,7 +147,7 @@ print(info["apiProjectId"], info["generationId"])
 restoration or final settlement is still pending; stage progress alone does not
 indicate overall completion.
 
-`complete` means restored media is ready. Diffio 4.6 transcribes the recording
+`complete` means restored media is ready. Diffio 4.7 transcribes the recording
 before restoration starts, so a completed generation has its transcript; while a
 generation runs, transcription can be `pending`, `available`, or `unavailable`.
 Read `progress.transcription.status` independently; `progress.transcription` is `None`
@@ -155,6 +157,20 @@ are set while the API reports them and `None` otherwise. A completed generation
 remains successful if transcription is unavailable. Completion webhooks expose
 the same optional `event.transcription` object; a later transcript does not emit
 another `generation.completed` event.
+
+`progress.warnings` lists things to know about the recording; the generation still runs. It is
+empty until the transcript is ready. Each item is a `GenerationWarning` with `code`, `languages`,
+and a readable `message`. `code == "unsupported_language"` means the transcript has speech in
+`languages` (ISO 639-1 codes such as `ja`, most words first) that Diffio does not support yet,
+so the result probably won't be usable. Generation webhooks carry the same warnings as
+`event.warnings` (an empty list when the payload has none).
+
+When a generation fails, `progress.retryable` is `True` if a new generation for the same project
+can fix it (for example, transcription that did not succeed after its automatic retries) and
+`False` otherwise (for example, an upload with no speech). It is `None` when there is no error.
+To retry, create a new generation for the project with a new `idempotencyKey` (or none); reusing
+the key returns the failed generation. `restore_audio` copies both into `info["warnings"]` and
+`info["retryable"]`.
 
 ```py
 from diffio import DiffioClient
@@ -168,6 +184,10 @@ progress = client.generations.get_progress(
 print(progress.status)
 if progress.transcription is not None:
     print(progress.transcription.status)
+for warning in progress.warnings:
+    print(warning.code, warning.languages, warning.message)
+if progress.status == "failed" and progress.retryable:
+    retry = client.generations.create(apiProjectId="proj_123")
 ```
 
 ## Generation download
@@ -312,11 +332,19 @@ async def diffio_webhook(request: Request):
     return {"ok": True}
 ```
 
+## Upgrading to 0.4.0
+
+0.4.0 adds Diffio 4.7 Flash (`diffio-4.7-flash`) and Diffio 4.7 Pro (`diffio-4.7-pro`), and the
+default model is now `diffio-4.7-flash`. Older model names still work and run Diffio 4.7, but
+they are deprecated and emit a `DeprecationWarning`. Generation progress adds `warnings` and
+`retryable`, and generation webhook events add `warnings`. Code written for 0.3.x runs without
+changes.
+
 ## Upgrading to 0.3.0
 
-0.3.0 adds Diffio 4.6 Flash (`diffio-4.6-flash`) and Diffio 4.6 Pro (`diffio-4.6-pro`), and the
-default model is now `diffio-4.6-flash`. Request and response shapes are unchanged, and code
-written for 0.2.x runs without changes.
+0.3.0 added Diffio 4.6 Flash (`diffio-4.6-flash`) and Diffio 4.6 Pro (`diffio-4.6-pro`), and the
+default model became `diffio-4.6-flash`. Request and response shapes were unchanged, and code
+written for 0.2.x ran without changes.
 
 ## Upgrading to 0.2.0
 

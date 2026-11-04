@@ -23,6 +23,8 @@ from .types import (
     GenerationProgressResponse,
     GenerationProgressStage,
     GenerationTranscription,
+    GenerationWarning,
+    GenerationWarningCode,
     GenerationWebhookEvent,
     GenerationWebhookStatus,
     ListProjectGenerationsResponse,
@@ -57,6 +59,8 @@ __all__ = [
     "GenerationProgressResponse",
     "GenerationProgressStage",
     "GenerationTranscription",
+    "GenerationWarning",
+    "GenerationWarningCode",
     "GenerationWebhookEvent",
     "GenerationWebhookStatus",
     "GenerationsClient",
@@ -78,4 +82,4 @@ __all__ = [
     "WebhooksClient",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
