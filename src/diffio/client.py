@@ -1,154 +1,77 @@
 import json
 import mimetypes
 import os
-import sys
-import tempfile
 import time
-import warnings
-from urllib.parse import urlparse
+import uuid
+from urllib.parse import quote
 
 import httpx
-from svix.webhooks import Webhook
 
-from .errors import DiffioApiError
-from .types import (
-    AccountSettingsResponse,
-    ApiKeyResponse,
-    ApiKeysListResponse,
-    AudioIsolationResult,
-    CompleteProjectUploadResponse,
-    CreateGenerationResponse,
-    CreateProjectResponse,
-    DownloadType,
-    GenerationDownloadResponse,
-    GenerationProgressResponse,
-    GenerationWebhookEvent,
-    ListProjectGenerationsResponse,
-    ListProjectsResponse,
-    ModelKey,
-    UsageSummaryResponse,
-    WebhookConfigureResponse,
-    WebhookEventType,
-    WebhookMode,
-    WebhookTestEventResponse,
-)
+from .errors import DiffioApiError, DiffioError
+from .types import ApiObject, RestoreResult
 
 DEFAULT_BASE_URL = "https://api.diffio.ai"
-API_PREFIX = "v1"
-# Generation endpoint per model; the API answers every other model id with HTTP 410 model_retired.
-MODEL_ENDPOINTS = {
-    "diffio-4.7-flash": "diffio-4.7-flash-generation",
-    "diffio-4.7-pro": "diffio-4.7-pro-generation",
-}
-# Deprecated keys from code written against 0.2.x and 0.3.x; they run the matching 4.7 model and emit a
-# DeprecationWarning. Not advertised.
-_DEPRECATED_MODEL_KEYS = {
-    "diffio-4.6-flash": "diffio-4.7-flash",
-    "diffio-4.6-pro": "diffio-4.7-pro",
-    "diffio-4.5-flash": "diffio-4.7-flash",
-    "diffio-4.5-pro": "diffio-4.7-pro",
-}
-# Diffio 4.7 Flash is available on every plan; Diffio 4.7 Pro needs a paid plan.
-DEFAULT_MODEL_KEY = "diffio-4.7-flash"
-DEFAULT_RETRY_STATUS_CODES = [408, 429, 500, 502, 503, 504]
+API_VERSION_PATH = "/v2"
+DEFAULT_MODEL = "diffio-flash"
+DEFAULT_TIMEOUT = 60.0
+DEFAULT_MAX_RETRIES = 2
 DEFAULT_RETRY_BACKOFF = 0.5
+MAX_RETRY_DELAY = 30.0
+RETRY_STATUS_CODES = (408, 429, 500, 502, 503, 504)
+# Completing an upload probes the file inside the request; the API allows it up to 180 seconds.
+COMPLETE_UPLOAD_TIMEOUT = 180.0
+END_USER_HEADER = "Diffio-End-User"
+IDEMPOTENCY_HEADER = "Idempotency-Key"
+
+# Code for an answer that carries no error.code of its own, by HTTP status (same table as the API).
+_STATUS_ERROR_CODES = {
+    400: "invalid_request",
+    401: "unauthenticated",
+    402: "payment_required",
+    403: "permission_denied",
+    404: "not_found",
+    405: "method_not_allowed",
+    409: "conflict",
+    411: "length_required",
+    413: "payload_too_large",
+    415: "unsupported_media_type",
+    429: "rate_limited",
+    500: "internal_error",
+    502: "internal_error",
+    503: "unavailable",
+    504: "unavailable",
+}
+
+_NO_BODY = object()
 
 
 class RequestOptions:
-    def __init__(
-        self,
-        *,
-        headers=None,
-        timeout=None,
-        timeoutInSeconds=None,
-        maxRetries=None,
-        retryBackoff=None,
-        retryStatusCodes=None,
-        apiKey=None,
-    ):
-        self.headers = headers or {}
-        self.timeout = timeoutInSeconds if timeoutInSeconds is not None else timeout
-        self.maxRetries = maxRetries
-        self.retryBackoff = retryBackoff
-        self.retryStatusCodes = retryStatusCodes
-        self.apiKey = apiKey
+    """Per-call overrides: extra headers, timeout (seconds), max_retries, retry_backoff, api_key."""
+
+    def __init__(self, *, headers=None, timeout=None, max_retries=None, retry_backoff=None, api_key=None):
+        self.headers = dict(headers or {})
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
+        self.api_key = api_key
 
 
-def _normalize_request_options(options):
-    if options is None:
+def _request_options(value):
+    if value is None:
         return RequestOptions()
-    if isinstance(options, RequestOptions):
-        return options
-    if isinstance(options, dict):
-        timeout = options.get("timeout")
-        timeout_in_seconds = options.get("timeoutInSeconds")
-        if timeout_in_seconds is not None:
-            timeout = timeout_in_seconds
-        return RequestOptions(
-            headers=options.get("headers"),
-            timeout=timeout,
-            maxRetries=options.get("maxRetries"),
-            retryBackoff=options.get("retryBackoff"),
-            retryStatusCodes=options.get("retryStatusCodes"),
-            apiKey=options.get("apiKey"),
-        )
-    raise ValueError("requestOptions must be a RequestOptions or dict")
-
-
-def _merge_request_options(base_options, override_options):
-    if override_options is None:
-        return base_options
-    override = _normalize_request_options(override_options)
-    headers = {}
-    if base_options.headers:
-        headers.update(base_options.headers)
-    if override.headers:
-        headers.update(override.headers)
-    return RequestOptions(
-        headers=headers,
-        timeout=override.timeout if override.timeout is not None else base_options.timeout,
-        maxRetries=override.maxRetries if override.maxRetries is not None else base_options.maxRetries,
-        retryBackoff=override.retryBackoff if override.retryBackoff is not None else base_options.retryBackoff,
-        retryStatusCodes=(
-            override.retryStatusCodes
-            if override.retryStatusCodes is not None
-            else base_options.retryStatusCodes
-        ),
-        apiKey=override.apiKey if override.apiKey is not None else base_options.apiKey,
-    )
-
-
-def _normalize_svix_headers(headers):
-    normalized = {}
-    if headers is None:
-        return normalized
-    if not hasattr(headers, "items"):
-        raise ValueError("headers must be a dict-like object")
-    for key, value in headers.items():
-        if value is None:
-            continue
-        if isinstance(value, (list, tuple)):
-            normalized[str(key).lower()] = ",".join([str(item) for item in value])
-        else:
-            normalized[str(key).lower()] = str(value)
-    return normalized
-
-
-def _extract_svix_headers(headers):
-    normalized = _normalize_svix_headers(headers)
-    required = ["svix-id", "svix-timestamp", "svix-signature"]
-    missing = [header for header in required if not normalized.get(header)]
-    if missing:
-        raise DiffioApiError(f"Missing webhook headers: {', '.join(missing)}")
-    return {
-        "svix-id": normalized["svix-id"],
-        "svix-timestamp": normalized["svix-timestamp"],
-        "svix-signature": normalized["svix-signature"],
-    }
+    if isinstance(value, RequestOptions):
+        return value
+    if isinstance(value, dict):
+        known = {"headers", "timeout", "max_retries", "retry_backoff", "api_key"}
+        unknown = sorted(set(value) - known)
+        if unknown:
+            raise ValueError(f"Unknown request option(s): {', '.join(unknown)}")
+        return RequestOptions(**value)
+    raise ValueError("request_options must be a RequestOptions or a dict")
 
 
 def sdk_identity_headers():
-    """Headers that identify this SDK and its version to the Diffio API, matching the JavaScript SDK's."""
+    """Headers that name this SDK and its version to the Diffio API."""
     from . import __version__
 
     return {
@@ -159,55 +82,163 @@ def sdk_identity_headers():
     }
 
 
-def _default_request_options():
-    return RequestOptions(
-        headers=sdk_identity_headers(),
-        timeout=None,
-        maxRetries=0,
-        retryBackoff=DEFAULT_RETRY_BACKOFF,
-        retryStatusCodes=list(DEFAULT_RETRY_STATUS_CODES),
-        apiKey=None,
+def resolve_base_url(base_url=None):
+    """The v2 base URL: base_url, else DIFFIO_API_BASE_URL, else https://api.diffio.ai, ending in /v2."""
+    resolved = (base_url or os.environ.get("DIFFIO_API_BASE_URL") or DEFAULT_BASE_URL).strip().rstrip("/")
+    if resolved.endswith(API_VERSION_PATH):
+        return resolved
+    # Older setups pointed DIFFIO_API_BASE_URL at .../v1; this release speaks /v2 only.
+    if resolved.endswith("/v1"):
+        resolved = resolved[: -len("/v1")]
+    return resolved + API_VERSION_PATH
+
+
+def path_id(value, name):
+    """The id of value (an id string or an object with .id), percent-encoded for a URL path."""
+    if isinstance(value, ApiObject):
+        value = value.get("id")
+    if value is None or not str(value).strip():
+        raise ValueError(f"{name} is required")
+    return quote(str(value), safe="")
+
+
+def drop_none(values):
+    return {key: value for key, value in values.items() if value is not None}
+
+
+def _retry_delay(attempt, backoff, response=None):
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(max(float(retry_after), 0.0), MAX_RETRY_DELAY)
+            except ValueError:
+                pass
+    if not backoff:
+        return 0.0
+    return min(backoff * (2 ** attempt), MAX_RETRY_DELAY)
+
+
+def _sleep(seconds):
+    if seconds > 0:
+        time.sleep(seconds)
+
+
+def api_error_from_response(response):
+    """Build the DiffioApiError for a non-2xx answer of the API or the media host."""
+    status = response.status_code
+    request_id = response.headers.get("X-Request-Id")
+    body = None
+    code = None
+    message = None
+    details = None
+    try:
+        body = response.json() if response.content else None
+    except ValueError:
+        body = response.text or None
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            code = error.get("code")
+            message = error.get("message")
+            details = error.get("details")
+            request_id = error.get("request_id") or request_id
+        elif isinstance(error, str):
+            message = error
+    code = code or _STATUS_ERROR_CODES.get(status) or ("internal_error" if status >= 500 else "invalid_request")
+    message = message or f"Request failed with status {status}"
+    return DiffioApiError(
+        message,
+        status=status,
+        code=code,
+        request_id=request_id,
+        details=details,
+        body=body,
+        headers=dict(response.headers),
     )
 
 
+def connection_error(exc):
+    error = DiffioApiError(f"Could not reach Diffio: {exc}", code="connection_error")
+    error.__cause__ = exc
+    return error
+
+
+def parse_json_response(response):
+    if not response.content:
+        return {}
+    try:
+        return response.json()
+    except ValueError:
+        raise DiffioApiError(
+            "The answer was not JSON",
+            status=response.status_code,
+            code="invalid_response",
+            request_id=response.headers.get("X-Request-Id"),
+            body=response.text,
+        ) from None
+
+
 class DiffioClient:
+    """Client of the Diffio API v2.
+
+    api_key defaults to DIFFIO_API_KEY. base_url defaults to DIFFIO_API_BASE_URL, else https://api.diffio.ai;
+    /v2 is added. end_user, when set, is sent as Diffio-End-User on every call (a call's own end_user wins).
+    Calls that are safe to repeat are retried on 408, 429, 5xx and network errors, max_retries times, with
+    exponential backoff from retry_backoff seconds (Retry-After is honoured).
+    """
+
     def __init__(
         self,
+        api_key=None,
         *,
-        apiKey=None,
-        baseUrl=None,
-        timeout=60.0,
-        timeoutInSeconds=None,
-        httpClient=None,
-        requestOptions=None,
+        base_url=None,
+        end_user=None,
+        timeout=DEFAULT_TIMEOUT,
+        max_retries=DEFAULT_MAX_RETRIES,
+        retry_backoff=DEFAULT_RETRY_BACKOFF,
+        headers=None,
+        http_client=None,
     ):
-        resolved_key = apiKey or os.environ.get("DIFFIO_API_KEY")
-        if not resolved_key:
-            raise ValueError("apiKey is required")
+        from .resources import (
+            AssistantResource,
+            EditsResource,
+            ExportsResource,
+            GenerationsResource,
+            MixResource,
+            ModelsResource,
+            ProjectsResource,
+            SharesResource,
+            TranscriptsResource,
+            UsageResource,
+            WebhooksResource,
+        )
 
-        resolved_base = baseUrl or os.environ.get("DIFFIO_API_BASE_URL") or DEFAULT_BASE_URL
-        resolved_base = resolved_base.rstrip("/")
-        api_prefix = "" if resolved_base.endswith(f"/{API_PREFIX}") else API_PREFIX
-
-        self.apiKey = resolved_key
-        self.baseUrl = resolved_base
-        self._api_prefix = api_prefix
-        resolved_timeout = timeoutInSeconds if timeoutInSeconds is not None else timeout
-        if httpClient is None:
-            self._client = httpx.Client(base_url=resolved_base, timeout=resolved_timeout)
-            self._owns_client = True
+        self.api_key = api_key or os.environ.get("DIFFIO_API_KEY") or None
+        self.base_url = resolve_base_url(base_url)
+        self.end_user = end_user
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
+        self.headers = dict(headers or {})
+        if http_client is None:
+            self._http = httpx.Client(timeout=timeout)
+            self._owns_http = True
         else:
-            self._client = httpClient
-            self._owns_client = False
-        self._default_request_options = _merge_request_options(_default_request_options(), requestOptions)
+            self._http = http_client
+            self._owns_http = False
 
-        self.audio_isolation = AudioIsolationClient(self)
-        self.generations = GenerationsClient(self)
-        self.projects = ProjectsClient(self)
-        self.account = AccountClient(self)
-        self.api_keys = ApiKeysClient(self)
-        self.usage = UsageClient(self)
-        self.webhooks = WebhooksClient(self)
+        self.models = ModelsResource(self)
+        self.projects = ProjectsResource(self)
+        self.generations = GenerationsResource(self)
+        self.edits = EditsResource(self)
+        self.mix = MixResource(self)
+        self.exports = ExportsResource(self)
+        self.transcripts = TranscriptsResource(self)
+        self.assistant = AssistantResource(self)
+        self.shares = SharesResource(self)
+        self.usage = UsageResource(self)
+        self.webhooks = WebhooksResource(self)
 
     def __enter__(self):
         return self
@@ -216,1643 +247,178 @@ class DiffioClient:
         self.close()
 
     def close(self):
-        if self._owns_client:
-            self._client.close()
+        if self._owns_http:
+            self._http.close()
 
-    def create_project(
+    def restore_audio(
         self,
+        file_path,
         *,
-        filePath,
-        contentType=None,
-        contentLength=None,
-        params=None,
-        fileFormat=None,
-        requestOptions=None,
-    ):
-        """
-        Creates a project, uploads the file, and confirms the upload.
-
-        The file goes to the Diffio upload API in parts of the session's
-        partSizeBytes (32 MiB), authorized by the session's upload token. With
-        maxRetries set, a failed part is retried on its own. After the upload,
-        create_project calls complete_project_upload so preprocessing starts.
-
-        Returns
-        -------
-        CreateProjectResponse
-            The project id, its upload session, and uploadCompletion.
-        """
-        payload = _build_create_project_payload(
-            filePath=filePath,
-            contentType=contentType,
-            contentLength=contentLength,
-            params=params,
-            fileFormat=fileFormat,
-        )
-
-        response = self._request("POST", "create_project", json_payload=payload, requestOptions=requestOptions)
-        project = CreateProjectResponse.from_dict(response)
-        self._upload_project_file_to_edge(
-            upload=project.upload,
-            filePath=os.fspath(filePath),
-            requestOptions=requestOptions,
-        )
-        project.uploadCompletion = self.complete_project_upload(
-            apiProjectId=project.apiProjectId,
-            requestOptions=requestOptions,
-        )
-        return project
-
-    def complete_project_upload(self, *, apiProjectId, requestOptions=None):
-        """
-        Confirms that a project's upload landed so preprocessing starts.
-
-        create_project calls this after its upload. It is idempotent, so it is
-        safe to call again for a project whose upload already finished.
-
-        Returns
-        -------
-        CompleteProjectUploadResponse
-            The project id, upload status, and stored size in bytes.
-        """
-        if not apiProjectId:
-            raise ValueError("apiProjectId is required")
-        response = self._request(
-            "POST",
-            "complete_project_upload",
-            json_payload={"apiProjectId": apiProjectId},
-            requestOptions=requestOptions,
-        )
-        return CompleteProjectUploadResponse.from_dict(response)
-
-    def _upload_project_file_to_edge(self, *, upload, filePath, requestOptions=None):
-        """Sends a file through the edge multipart upload API (start, parts, complete) with the session token.
-
-        Each part is retried on its own under the request options' retry policy. Any failure after
-        start aborts the multipart upload before the error is raised.
-        """
-        merged_options = _merge_request_options(self._default_request_options, requestOptions)
-        size_bytes = os.path.getsize(filePath)
-        if size_bytes > upload.maxBytes:
-            raise ValueError(
-                f"{filePath} is {size_bytes} bytes; the upload limit is {upload.maxBytes} bytes"
-            )
-
-        started = self._send_edge_upload_request(
-            upload,
-            "POST",
-            "start",
-            content=b"{}",
-            contentType="application/json",
-            mergedOptions=merged_options,
-        )
-        upload_id = started.get("uploadId")
-        if not isinstance(upload_id, str) or not upload_id:
-            raise DiffioApiError("The edge upload start response has no uploadId", responseBody=started)
-        part_size_bytes = started.get("partSizeBytes")
-        if not isinstance(part_size_bytes, int) or isinstance(part_size_bytes, bool) or part_size_bytes <= 0:
-            part_size_bytes = upload.partSizeBytes
-
-        try:
-            receipts = []
-            with open(filePath, "rb") as handle:
-                for part_number, start_byte, end_byte in _plan_edge_upload_parts(size_bytes, part_size_bytes):
-                    handle.seek(start_byte)
-                    part_bytes = handle.read(end_byte - start_byte)
-                    if len(part_bytes) != end_byte - start_byte:
-                        raise ValueError(f"{filePath} changed size during the upload")
-                    receipt = self._send_edge_upload_request(
-                        upload,
-                        "PUT",
-                        f"parts/{part_number}",
-                        params={"uploadId": upload_id},
-                        content=part_bytes,
-                        contentType="application/octet-stream",
-                        mergedOptions=merged_options,
-                    )
-                    etag = receipt.get("etag")
-                    if not isinstance(etag, str) or not etag:
-                        raise DiffioApiError(
-                            f"The edge upload part {part_number} response has no etag",
-                            responseBody=receipt,
-                        )
-                    receipts.append({"partNumber": part_number, "etag": etag})
-            self._send_edge_upload_request(
-                upload,
-                "POST",
-                "complete",
-                content=json.dumps({"uploadId": upload_id, "parts": receipts}).encode("utf-8"),
-                contentType="application/json",
-                mergedOptions=merged_options,
-            )
-        except Exception:
-            # Release the partial multipart upload; a failed abort never hides the upload error.
-            try:
-                self._send_edge_upload_request(
-                    upload,
-                    "POST",
-                    "abort",
-                    content=json.dumps({"uploadId": upload_id}).encode("utf-8"),
-                    contentType="application/json",
-                    mergedOptions=merged_options,
-                    allowRetries=False,
-                )
-            except Exception:
-                pass
-            raise
-
-    def _send_edge_upload_request(
-        self,
-        upload,
-        method,
-        action,
-        *,
-        content,
-        contentType,
-        mergedOptions,
-        params=None,
-        allowRetries=True,
-    ):
-        url = f"{upload.edgeBaseUrl}/v1/uploads/{action}"
-        # The upload token is the only credential the edge accepts; the API key never leaves the API host.
-        headers = {
-            key: value
-            for key, value in (mergedOptions.headers or {}).items()
-            if str(key).lower() not in {"authorization", "content-type", "content-length"}
-        }
-        headers["Content-Type"] = contentType
-        headers["Authorization"] = f"Bearer {upload.uploadToken}"
-        timeout = mergedOptions.timeout
-        max_retries = mergedOptions.maxRetries if mergedOptions.maxRetries is not None else 0
-        if not allowRetries:
-            max_retries = 0
-        retry_backoff = (
-            mergedOptions.retryBackoff if mergedOptions.retryBackoff is not None else DEFAULT_RETRY_BACKOFF
-        )
-        retry_statuses = (
-            mergedOptions.retryStatusCodes
-            if mergedOptions.retryStatusCodes is not None
-            else DEFAULT_RETRY_STATUS_CODES
-        )
-
-        attempt = 0
-        while True:
-            try:
-                request_kwargs = {
-                    "method": method,
-                    "url": url,
-                    "headers": headers,
-                    "content": content,
-                }
-                if params:
-                    request_kwargs["params"] = params
-                if timeout is not None:
-                    request_kwargs["timeout"] = timeout
-                response = self._client.request(**request_kwargs)
-            except httpx.RequestError:
-                if attempt >= max_retries:
-                    raise
-                _sleep_retry(attempt, retry_backoff)
-                attempt += 1
-                continue
-
-            if retry_statuses and response.status_code in retry_statuses and attempt < max_retries:
-                response.close()
-                _sleep_retry(attempt, retry_backoff)
-                attempt += 1
-                continue
-
-            return _raise_for_error(response)
-
-    def create_generation(
-        self,
-        *,
-        apiProjectId,
-        model=DEFAULT_MODEL_KEY,
+        model=DEFAULT_MODEL,
+        output_path=None,
+        file="audio",
+        file_name=None,
+        content_type=None,
+        label=None,
         sampling=None,
-        params=None,
-        idempotencyKey=None,
-        requestOptions=None,
+        metadata=None,
+        end_user=None,
+        idempotency_key=None,
+        timeout=3600.0,
+        poll_interval=2.0,
+        on_progress=None,
+        request_options=None,
     ):
-        """Create a generation; automatic retries require a supplied idempotency key."""
-        endpoint = MODEL_ENDPOINTS[_resolve_model_key(model)]
+        """Restore one recording: create the project, upload, generate, wait, download.
 
-        payload = {"apiProjectId": apiProjectId}
+        file_path is a path, bytes or a binary file object (bytes and file objects need file_name). The
+        generation is requested with the project, so it starts as soon as the upload is ready. The result
+        file (file="audio" is the restored MP3; any name of GET .../media files works) is written to
+        output_path, or returned as RestoreResult.content when output_path is None. Raises
+        GenerationFailedError when the restore fails and DiffioTimeoutError after timeout seconds.
+        """
+        resolved_name = file_name
+        size_bytes = None
+        if isinstance(file_path, (str, os.PathLike)):
+            resolved_path = os.fspath(file_path)
+            resolved_name = resolved_name or os.path.basename(resolved_path)
+            size_bytes = os.path.getsize(resolved_path)
+        elif isinstance(file_path, (bytes, bytearray, memoryview)):
+            size_bytes = len(file_path)
+        if not resolved_name:
+            raise ValueError("file_name is required when file_path is bytes or a file object")
+        guessed_type = content_type or mimetypes.guess_type(resolved_name)[0]
+
+        generation = {"model": model}
+        if label is not None:
+            generation["label"] = label
         if sampling is not None:
-            payload["sampling"] = sampling
-        if params:
-            payload["params"] = params
-        if idempotencyKey is not None:
-            payload["idempotencyKey"] = idempotencyKey
+            generation["sampling"] = sampling
 
-        response = self._request(
-            "POST",
-            endpoint,
-            json_payload=payload,
-            requestOptions=requestOptions,
-            allow_retries=isinstance(idempotencyKey, str) and bool(idempotencyKey.strip()),
+        project = self.projects.create(
+            file_name=resolved_name,
+            size_bytes=size_bytes,
+            content_type=guessed_type,
+            metadata=metadata,
+            generation=generation,
+            end_user=end_user,
+            idempotency_key=idempotency_key,
+            request_options=request_options,
         )
-        return CreateGenerationResponse.from_dict(response)
-
-    def list_projects(self, *, requestOptions=None):
-        """
-        Lists projects owned by the API key.
-
-        Returns
-        -------
-        ListProjectsResponse
-            Project summaries ordered by creation time.
-
-        Examples
-        --------
-        from diffio import DiffioClient
-
-        client = DiffioClient(apiKey="diffio_live_...")
-        projects = client.list_projects()
-        print(projects.projects[0].apiProjectId)
-        """
-        response = self._request("POST", "list_projects", json_payload={}, requestOptions=requestOptions)
-        return ListProjectsResponse.from_dict(response)
-
-    def list_project_generations(
-        self,
-        *,
-        apiProjectId,
-        requestOptions=None,
-    ):
-        """
-        Lists generations for a project owned by the API key.
-
-        Parameters
-        ----------
-        apiProjectId : str
-            The project id to list generations for.
-
-        Returns
-        -------
-        ListProjectGenerationsResponse
-            Generation summaries ordered by creation time.
-
-        Examples
-        --------
-        from diffio import DiffioClient
-
-        client = DiffioClient(apiKey="diffio_live_...")
-        generations = client.list_project_generations(apiProjectId="proj_123")
-        print(generations.generations[0].generationId)
-        """
-        if not apiProjectId:
-            raise ValueError("apiProjectId is required")
-        response = self._request(
-            "POST",
-            "list_project_generations",
-            json_payload={"apiProjectId": apiProjectId},
-            requestOptions=requestOptions,
+        if project.latest_generation is None:
+            raise DiffioError("The project answer named no generation")
+        uploaded = self.projects.upload(
+            project, file_path, end_user=end_user, request_options=request_options
         )
-        return ListProjectGenerationsResponse.from_dict(response)
-
-    def get_generation_progress(
-        self,
-        *,
-        generationId,
-        apiProjectId=None,
-        requestOptions=None,
-    ):
-        """
-        Gets progress for a generation.
-
-        Parameters
-        ----------
-        generationId : str
-            The generation id to query.
-        apiProjectId : str, optional
-            Optional project id, used to speed up lookup.
-
-        Returns
-        -------
-        GenerationProgressResponse
-            Current generation progress.
-
-        Examples
-        --------
-        from diffio import DiffioClient
-
-        client = DiffioClient(apiKey="diffio_live_...")
-        progress = client.get_generation_progress(
-            generationId="gen_123",
-            apiProjectId="proj_123",
-        )
-        print(progress.status)
-        """
-        payload = {"generationId": generationId}
-        if apiProjectId is not None:
-            payload["apiProjectId"] = apiProjectId
-
-        response = self._request(
-            "POST",
-            "get_generation_progress",
-            json_payload=payload,
-            requestOptions=requestOptions,
-        )
-        return GenerationProgressResponse.from_dict(response)
-
-    def wait_for_generation(
-        self,
-        *,
-        generationId,
-        apiProjectId=None,
-        pollInterval=2.0,
-        timeout=600.0,
-        onProgress=None,
-        showProgress=False,
-        requestOptions=None,
-    ):
-        """
-        Polls generation progress until completion or failure.
-
-        Completion means restored media is ready. Diffio 4.7 transcribes the
-        recording before restoration; read progress.transcription for the
-        transcript state and progress.warnings for things to know about the
-        recording (for example unsupported_language) while a generation runs.
-        A failed generation raises RuntimeError; read progress.retryable from
-        get_generation_progress to learn whether a new generation for the same
-        project can retry it.
-
-        Parameters
-        ----------
-        generationId : str
-            The generation id to wait for.
-        apiProjectId : str, optional
-            Optional project id, used to speed up lookup.
-        pollInterval : float
-            Seconds to wait between polls.
-        timeout : float
-            Maximum seconds to wait before timing out.
-        onProgress : callable, optional
-            Callback invoked with each GenerationProgressResponse.
-        showProgress : bool
-            If true, prints progress updates to stdout.
-        """
-        deadline = time.monotonic() + timeout
-        last_progress = None
-
-        while time.monotonic() < deadline:
-            progress = self.get_generation_progress(
-                generationId=generationId,
-                apiProjectId=apiProjectId,
-                requestOptions=requestOptions,
-            )
-            last_progress = progress
-            _report_progress(progress, onProgress=onProgress, showProgress=showProgress)
-
-            if progress.status == "complete":
-                return progress
-
-            if progress.status == "failed":
-                raise RuntimeError(
-                    "Generation failed"
-                    f" (preProcessing={progress.preProcessing.status},"
-                    f" inference={progress.inference.status},"
-                    f" error={progress.error},"
-                    f" details={progress.errorDetails})"
-                )
-
-            time.sleep(pollInterval)
-
-        raise RuntimeError(
-            "Timed out waiting for generation completion"
-            f" (lastStatus={getattr(last_progress, 'status', None)})"
-        )
-
-    def get_generation_download(
-        self,
-        *,
-        generationId,
-        apiProjectId,
-        downloadType=None,
-        requestOptions=None,
-    ):
-        """
-        Gets a download URL for a generation. The URL is valid for 6 hours.
-
-        Parameters
-        ----------
-        generationId : str
-            The generation id to download.
-        apiProjectId : str
-            The project id that owns the generation.
-        downloadType : str, optional
-            Optional download type, audio, mp3, video, or transcript.
-
-        Returns
-        -------
-        GenerationDownloadResponse
-            Download URL and file metadata.
-
-        Raises
-        ------
-        DiffioApiError
-            Transcript downloads return statusCode 409 with responseBody code
-            TRANSCRIPT_PENDING, or 404 with code TRANSCRIPT_UNAVAILABLE. Overall
-            generation completion does not guarantee transcript availability.
-
-        Examples
-        --------
-        from diffio import DiffioClient
-
-        client = DiffioClient(apiKey="diffio_live_...")
-        download = client.get_generation_download(
-            generationId="gen_123",
-            apiProjectId="proj_123",
-            downloadType="audio",
-        )
-        print(download.downloadUrl)
-        """
-        payload = {"generationId": generationId, "apiProjectId": apiProjectId}
-        if downloadType is not None:
-            resolved_download_type, _ = _normalize_download_type(downloadType)
-            payload["downloadType"] = resolved_download_type
-
-        response = self._request(
-            "POST",
-            "get_generation_download",
-            json_payload=payload,
-            requestOptions=requestOptions,
-        )
-        return GenerationDownloadResponse.from_dict(response)
-
-    def send_webhook_test_event(
-        self,
-        *,
-        eventType,
-        mode,
-        apiKeyId=None,
-        samplePayload=None,
-        requestOptions=None,
-    ):
-        """
-        Sends a test webhook event.
-
-        Parameters
-        ----------
-        eventType : str
-            One of the supported generation webhook event types.
-        mode : str
-            Webhook mode, test or live.
-        apiKeyId : str, optional
-            Optional API key id to validate access.
-        samplePayload : dict, optional
-            Sample payload overrides. Must be a dict.
-
-        Returns
-        -------
-        WebhookTestEventResponse
-            Webhook message metadata.
-        """
-        if eventType not in WebhookEventType:
-            raise ValueError("eventType is not supported")
-        if mode not in WebhookMode:
-            raise ValueError("mode must be test or live")
-        if samplePayload is not None and not isinstance(samplePayload, dict):
-            raise ValueError("samplePayload must be an object")
-
-        payload = {"eventType": eventType, "mode": mode}
-        if apiKeyId is not None:
-            payload["apiKeyId"] = apiKeyId
-        if samplePayload is not None:
-            payload["samplePayload"] = samplePayload
-
-        response = self._request(
-            "POST",
-            "webhooks/send_test_event",
-            json_payload=payload,
-            requestOptions=requestOptions,
-        )
-        return WebhookTestEventResponse.from_dict(response)
-
-    def get_account_settings(self, *, requestOptions=None):
-        response = self._request(
-            "POST",
-            "account/settings/get",
-            json_payload={},
-            requestOptions=requestOptions,
-        )
-        return AccountSettingsResponse.from_dict(response)
-
-    def update_account_settings(self, *, billingPolicy, requestOptions=None):
-        if not isinstance(billingPolicy, dict):
-            raise ValueError("billingPolicy must be an object")
-        response = self._request(
-            "POST",
-            "account/settings/update",
-            json_payload={"billingPolicy": billingPolicy},
-            requestOptions=requestOptions,
-        )
-        return AccountSettingsResponse.from_dict(response)
-
-    def create_api_key(self, *, label, scopes, resourceBounds=None, requestOptions=None):
-        if not label:
-            raise ValueError("label is required")
-        if not isinstance(scopes, list):
-            raise ValueError("scopes must be a list")
-        response = self._request(
-            "POST",
-            "api_keys/create",
-            json_payload={
-                "label": label,
-                "scopes": scopes,
-                "resourceBounds": resourceBounds or {},
-            },
-            requestOptions=requestOptions,
-        )
-        return ApiKeyResponse.from_dict(response)
-
-    def list_api_keys(self, *, requestOptions=None):
-        response = self._request(
-            "POST",
-            "api_keys/list",
-            json_payload={},
-            requestOptions=requestOptions,
-        )
-        return ApiKeysListResponse.from_dict(response)
-
-    def rotate_api_key(self, *, keyId, requestOptions=None):
-        if not keyId:
-            raise ValueError("keyId is required")
-        response = self._request(
-            "POST",
-            "api_keys/rotate",
-            json_payload={"keyId": keyId},
-            requestOptions=requestOptions,
-        )
-        return ApiKeyResponse.from_dict(response)
-
-    def revoke_api_key(self, *, keyId, requestOptions=None):
-        if not keyId:
-            raise ValueError("keyId is required")
-        response = self._request(
-            "POST",
-            "api_keys/revoke",
-            json_payload={"keyId": keyId},
-            requestOptions=requestOptions,
-        )
-        return ApiKeyResponse.from_dict(response)
-
-    def get_usage_summary(self, *, apiKeyId=None, requestOptions=None):
-        payload = {}
-        if apiKeyId is not None:
-            payload["apiKeyId"] = apiKeyId
-        response = self._request(
-            "POST",
-            "usage/summary",
-            json_payload=payload,
-            requestOptions=requestOptions,
-        )
-        return UsageSummaryResponse.from_dict(response)
-
-    def configure_webhook(
-        self,
-        *,
-        mode,
-        url,
-        eventTypes,
-        apiKeyId=None,
-        requestOptions=None,
-    ):
-        if mode not in WebhookMode:
-            raise ValueError("mode must be test or live")
-        if not url:
-            raise ValueError("url is required")
-        if not isinstance(eventTypes, list) or not eventTypes:
-            raise ValueError("eventTypes must be a non-empty list")
-        payload = {"mode": mode, "url": url, "eventTypes": eventTypes}
-        if apiKeyId is not None:
-            payload["apiKeyId"] = apiKeyId
-        response = self._request(
-            "POST",
-            "webhooks/configure",
-            json_payload=payload,
-            requestOptions=requestOptions,
-        )
-        return WebhookConfigureResponse.from_dict(response)
-
-    def restore_audio(
-        self,
-        *,
-        filePath,
-        contentType=None,
-        contentLength=None,
-        fileFormat=None,
-        model=DEFAULT_MODEL_KEY,
-        sampling=None,
-        projectParams=None,
-        generationParams=None,
-        downloadType="audio",
-        pollInterval=2.0,
-        timeout=600.0,
-        onProgress=None,
-        showProgress=False,
-        requestOptions=None,
-        progressRequestOptions=None,
-        downloadRequestOptions=None,
-        raiseOnError=False,
-    ):
-        return self.audio_isolation.restore_audio(
-            filePath=filePath,
-            contentType=contentType,
-            contentLength=contentLength,
-            fileFormat=fileFormat,
-            model=model,
-            sampling=sampling,
-            projectParams=projectParams,
-            generationParams=generationParams,
-            downloadType=downloadType,
-            pollInterval=pollInterval,
+        finished = self.generations.wait(
+            project.id,
+            project.latest_generation.id,
             timeout=timeout,
-            onProgress=onProgress,
-            showProgress=showProgress,
-            requestOptions=requestOptions,
-            progressRequestOptions=progressRequestOptions,
-            downloadRequestOptions=downloadRequestOptions,
-            raiseOnError=raiseOnError,
+            poll_interval=poll_interval,
+            on_progress=on_progress,
+            end_user=end_user,
+            request_options=request_options,
         )
+        media = self.generations.media(project.id, finished.id, end_user=end_user, request_options=request_options)
+        from .transfers import download_url, media_file_url
 
-    def _request(self, method, path, *, json_payload, requestOptions=None, allow_retries=True):
-        request_path = path.lstrip("/")
-        if self._api_prefix:
-            request_path = f"{self._api_prefix}/{request_path}"
-        merged_options = _merge_request_options(self._default_request_options, requestOptions)
-        api_key = merged_options.apiKey or self.apiKey
-        headers = _merge_headers({"Authorization": f"Bearer {api_key}"}, merged_options.headers)
-        timeout = merged_options.timeout
-        max_retries = merged_options.maxRetries if merged_options.maxRetries is not None else 0
-        # A lost response can hide an accepted generation; only its stable key makes replay safe.
-        if not allow_retries:
+        url = media_file_url(media, file)
+        if output_path is not None:
+            saved = download_url(self, url, path=output_path, request_options=request_options)
+            return RestoreResult(uploaded or project, finished, media, output_path=saved)
+        content = download_url(self, url, request_options=request_options)
+        return RestoreResult(uploaded or project, finished, media, content=content)
+
+    # ---- transport ------------------------------------------------------------------------------------
+
+    def _headers(self, options, *, auth, end_user, idempotency_key):
+        headers = sdk_identity_headers()
+        headers["Accept"] = "application/json"
+        headers.update(self.headers)
+        api_key = options.api_key or self.api_key
+        if auth and api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        if end_user is None:
+            end_user = self.end_user
+        if end_user is not None and end_user is not False:
+            headers[END_USER_HEADER] = str(end_user)
+        if idempotency_key is not None:
+            headers[IDEMPOTENCY_HEADER] = str(idempotency_key)
+        headers.update(options.headers)
+        return headers
+
+    def _send(self, method, url, *, headers, retry_safe, options, timeout=None, **kwargs):
+        """Send one request with the retry policy; return the final httpx.Response (any status).
+
+        kwargs go to httpx build_request (params, content); stream=True leaves the body unread.
+        """
+        max_retries = options.max_retries if options.max_retries is not None else self.max_retries
+        if not retry_safe:
             max_retries = 0
-        retry_backoff = (
-            merged_options.retryBackoff if merged_options.retryBackoff is not None else DEFAULT_RETRY_BACKOFF
-        )
-        retry_statuses = (
-            merged_options.retryStatusCodes
-            if merged_options.retryStatusCodes is not None
-            else DEFAULT_RETRY_STATUS_CODES
-        )
-
+        backoff = options.retry_backoff if options.retry_backoff is not None else self.retry_backoff
+        resolved_timeout = options.timeout if options.timeout is not None else timeout
+        if resolved_timeout is not None:
+            kwargs["timeout"] = resolved_timeout
+        stream = kwargs.pop("stream", False)
         attempt = 0
         while True:
             try:
-                request_kwargs = {
-                    "method": method,
-                    "url": request_path,
-                    "headers": headers,
-                    "json": json_payload,
-                }
-                if timeout is not None:
-                    request_kwargs["timeout"] = timeout
-                response = self._client.request(**request_kwargs)
-            except httpx.RequestError:
+                request = self._http.build_request(method, url, headers=headers, **kwargs)
+                response = self._http.send(request, stream=stream)
+            except httpx.TransportError as exc:
                 if attempt >= max_retries:
-                    raise
-                _sleep_retry(attempt, retry_backoff)
+                    raise connection_error(exc)
+                _sleep(_retry_delay(attempt, backoff))
                 attempt += 1
                 continue
-
-            if retry_statuses and response.status_code in retry_statuses and attempt < max_retries:
+            if response.status_code in RETRY_STATUS_CODES and attempt < max_retries:
+                delay = _retry_delay(attempt, backoff, response)
                 response.close()
-                _sleep_retry(attempt, retry_backoff)
+                _sleep(delay)
                 attempt += 1
                 continue
+            return response
 
-            return _raise_for_error(response)
-
-
-class AccountClient:
-    def __init__(self, parent):
-        self._parent = parent
-
-    def get_settings(self, *, requestOptions=None):
-        return self._parent.get_account_settings(requestOptions=requestOptions)
-
-    def update_settings(self, *, billingPolicy, requestOptions=None):
-        return self._parent.update_account_settings(
-            billingPolicy=billingPolicy,
-            requestOptions=requestOptions,
-        )
-
-
-class ApiKeysClient:
-    def __init__(self, parent):
-        self._parent = parent
-
-    def create(self, *, label, scopes, resourceBounds=None, requestOptions=None):
-        return self._parent.create_api_key(
-            label=label,
-            scopes=scopes,
-            resourceBounds=resourceBounds,
-            requestOptions=requestOptions,
-        )
-
-    def list(self, *, requestOptions=None):
-        return self._parent.list_api_keys(requestOptions=requestOptions)
-
-    def rotate(self, *, keyId, requestOptions=None):
-        return self._parent.rotate_api_key(keyId=keyId, requestOptions=requestOptions)
-
-    def revoke(self, *, keyId, requestOptions=None):
-        return self._parent.revoke_api_key(keyId=keyId, requestOptions=requestOptions)
-
-
-class UsageClient:
-    def __init__(self, parent):
-        self._parent = parent
-
-    def summary(self, *, apiKeyId=None, requestOptions=None):
-        return self._parent.get_usage_summary(apiKeyId=apiKeyId, requestOptions=requestOptions)
-
-
-class GenerationsClient:
-    def __init__(self, parent):
-        self._parent = parent
-
-    def create(
+    def _request(
         self,
+        method,
+        path,
         *,
-        apiProjectId,
-        model=DEFAULT_MODEL_KEY,
-        sampling=None,
-        params=None,
-        idempotencyKey=None,
-        requestOptions=None,
+        query=None,
+        body=_NO_BODY,
+        auth=True,
+        end_user=None,
+        idempotency_key=None,
+        retry_safe=None,
+        timeout=None,
+        request_options=None,
     ):
-        return self._parent.create_generation(
-            apiProjectId=apiProjectId,
-            model=model,
-            sampling=sampling,
-            params=params,
-            idempotencyKey=idempotencyKey,
-            requestOptions=requestOptions,
-        )
-
-    def get_progress(
-        self,
-        *,
-        generationId,
-        apiProjectId=None,
-        requestOptions=None,
-    ):
-        return self._parent.get_generation_progress(
-            generationId=generationId,
-            apiProjectId=apiProjectId,
-            requestOptions=requestOptions,
-        )
-
-    def get_download(
-        self,
-        *,
-        generationId,
-        apiProjectId,
-        downloadType=None,
-        requestOptions=None,
-    ):
-        return self._parent.get_generation_download(
-            generationId=generationId,
-            apiProjectId=apiProjectId,
-            downloadType=downloadType,
-            requestOptions=requestOptions,
-        )
-
-    def download(
-        self,
-        *,
-        generationId,
-        apiProjectId,
-        downloadFilePath,
-        downloadType=None,
-        requestOptions=None,
-    ):
-        """
-        Downloads a generation result directly to a file path.
-
-        Parameters
-        ----------
-        generationId : str
-            The generation id to download.
-        apiProjectId : str
-            The project id that owns the generation.
-        downloadFilePath : str
-            Local file path to write the downloaded media to.
-        downloadType : str, optional
-            Optional download type, audio, mp3, video, or transcript.
-
-        Returns
-        -------
-        GenerationDownloadResponse
-            Download metadata for the saved file.
-        """
-        resolved_path = os.fspath(downloadFilePath)
-        if not resolved_path:
-            raise ValueError("downloadFilePath is required")
-        if downloadType is not None:
-            resolved_download_type, _ = _normalize_download_type(downloadType)
-        else:
-            resolved_download_type = None
-
-        download = self._parent.get_generation_download(
-            generationId=generationId,
-            apiProjectId=apiProjectId,
-            downloadType=resolved_download_type,
-            requestOptions=requestOptions,
-        )
-        _warn_download_extension_mismatch(download, resolved_path)
-        _download_to_file(self._parent, download.downloadUrl, resolved_path, requestOptions=requestOptions)
-        return download
-
-    def wait_for_complete(
-        self,
-        *,
-        generationId,
-        apiProjectId=None,
-        pollInterval=2.0,
-        timeout=600.0,
-        onProgress=None,
-        showProgress=False,
-        requestOptions=None,
-    ):
-        return self._parent.wait_for_generation(
-            generationId=generationId,
-            apiProjectId=apiProjectId,
-            pollInterval=pollInterval,
+        options = _request_options(request_options)
+        headers = self._headers(options, auth=auth, end_user=end_user, idempotency_key=idempotency_key)
+        if retry_safe is None:
+            retry_safe = method in ("GET", "PUT", "DELETE") or idempotency_key is not None
+        kwargs = {}
+        if query:
+            kwargs["params"] = drop_none(query)
+        if body is not _NO_BODY:
+            headers["Content-Type"] = "application/json"
+            kwargs["content"] = json.dumps(body).encode("utf-8")
+        response = self._send(
+            method,
+            self.base_url + path,
+            headers=headers,
+            retry_safe=retry_safe,
+            options=options,
             timeout=timeout,
-            onProgress=onProgress,
-            showProgress=showProgress,
-            requestOptions=requestOptions,
+            **kwargs,
         )
-
-    def create_and_wait(
-        self,
-        *,
-        apiProjectId,
-        model=DEFAULT_MODEL_KEY,
-        sampling=None,
-        params=None,
-        idempotencyKey=None,
-        pollInterval=2.0,
-        timeout=600.0,
-        onProgress=None,
-        showProgress=False,
-        requestOptions=None,
-        progressRequestOptions=None,
-    ):
-        resolved_progress_options = requestOptions if progressRequestOptions is None else progressRequestOptions
-        generation = self.create(
-            apiProjectId=apiProjectId,
-            model=model,
-            sampling=sampling,
-            params=params,
-            idempotencyKey=idempotencyKey,
-            requestOptions=requestOptions,
-        )
-        progress = self.wait_for_complete(
-            generationId=generation.generationId,
-            apiProjectId=generation.apiProjectId,
-            pollInterval=pollInterval,
-            timeout=timeout,
-            onProgress=onProgress,
-            showProgress=showProgress,
-            requestOptions=resolved_progress_options,
-        )
-        return generation, progress
-
-
-class ProjectsClient:
-    def __init__(self, parent):
-        self._parent = parent
-
-    def list(self, *, requestOptions=None):
-        return self._parent.list_projects(requestOptions=requestOptions)
-
-    def complete_upload(self, *, apiProjectId, requestOptions=None):
-        return self._parent.complete_project_upload(
-            apiProjectId=apiProjectId,
-            requestOptions=requestOptions,
-        )
-
-    def list_generations(
-        self,
-        *,
-        apiProjectId,
-        requestOptions=None,
-    ):
-        return self._parent.list_project_generations(
-            apiProjectId=apiProjectId,
-            requestOptions=requestOptions,
-        )
-
-
-class WebhooksClient:
-    def __init__(self, parent):
-        self._parent = parent
-
-    def send_test_event(
-        self,
-        *,
-        eventType,
-        mode,
-        apiKeyId=None,
-        samplePayload=None,
-        requestOptions=None,
-    ):
-        return self._parent.send_webhook_test_event(
-            eventType=eventType,
-            mode=mode,
-            apiKeyId=apiKeyId,
-            samplePayload=samplePayload,
-            requestOptions=requestOptions,
-        )
-
-    def configure(
-        self,
-        *,
-        mode,
-        url,
-        eventTypes,
-        apiKeyId=None,
-        requestOptions=None,
-    ):
-        return self._parent.configure_webhook(
-            mode=mode,
-            url=url,
-            eventTypes=eventTypes,
-            apiKeyId=apiKeyId,
-            requestOptions=requestOptions,
-        )
-
-    def verify_signature(
-        self,
-        *,
-        payload,
-        headers,
-        secret,
-    ):
-        if not secret:
-            raise DiffioApiError("secret is required")
-        if payload is None:
-            raise DiffioApiError("payload is required")
-        if not isinstance(payload, (bytes, str)):
-            raise DiffioApiError("payload must be bytes or str")
-
-        webhook = Webhook(secret)
         try:
-            event = webhook.verify(payload, _extract_svix_headers(headers))
-        except Exception as exc:
-            raise DiffioApiError(str(exc))
-        if not isinstance(event, dict):
-            raise DiffioApiError("Webhook payload must be an object")
-        return GenerationWebhookEvent.from_dict(event)
-
-
-class AudioIsolationClient:
-    def __init__(self, parent):
-        self._parent = parent
-
-    def convert(
-        self,
-        *,
-        filePath,
-        contentType=None,
-        contentLength=None,
-        fileFormat=None,
-        model=DEFAULT_MODEL_KEY,
-        sampling=None,
-        projectParams=None,
-        generationParams=None,
-        requestOptions=None,
-    ):
-        return self.isolate(
-            filePath=filePath,
-            contentType=contentType,
-            contentLength=contentLength,
-            fileFormat=fileFormat,
-            model=model,
-            sampling=sampling,
-            projectParams=projectParams,
-            generationParams=generationParams,
-            requestOptions=requestOptions,
-        )
-
-    def isolate(
-        self,
-        *,
-        filePath,
-        contentType=None,
-        contentLength=None,
-        fileFormat=None,
-        model=DEFAULT_MODEL_KEY,
-        sampling=None,
-        projectParams=None,
-        generationParams=None,
-        requestOptions=None,
-    ):
-        model = _resolve_model_key(model)
-        project = self._parent.create_project(
-            filePath=filePath,
-            contentType=contentType,
-            contentLength=contentLength,
-            params=projectParams,
-            fileFormat=fileFormat,
-            requestOptions=requestOptions,
-        )
-
-        generation = self._parent.create_generation(
-            apiProjectId=project.apiProjectId,
-            model=model,
-            sampling=sampling,
-            params=generationParams,
-            requestOptions=requestOptions,
-        )
-
-        return AudioIsolationResult(project=project, generation=generation)
-
-    def restore_audio(
-        self,
-        *,
-        filePath,
-        contentType=None,
-        contentLength=None,
-        fileFormat=None,
-        model=DEFAULT_MODEL_KEY,
-        sampling=None,
-        projectParams=None,
-        generationParams=None,
-        downloadType="audio",
-        pollInterval=2.0,
-        timeout=600.0,
-        onProgress=None,
-        showProgress=False,
-        requestOptions=None,
-        progressRequestOptions=None,
-        downloadRequestOptions=None,
-        raiseOnError=False,
-    ):
-        metadata = _init_restore_metadata()
-        metadata["downloadType"] = downloadType
-        resolved_progress_options = requestOptions if progressRequestOptions is None else progressRequestOptions
-        resolved_download_options = requestOptions if downloadRequestOptions is None else downloadRequestOptions
-
-        try:
-            result = self.isolate(
-                filePath=filePath,
-                contentType=contentType,
-                contentLength=contentLength,
-                fileFormat=fileFormat,
-                model=model,
-                sampling=sampling,
-                projectParams=projectParams,
-                generationParams=generationParams,
-                requestOptions=requestOptions,
-            )
-        except Exception as exc:
-            metadata["stage"] = "isolate"
-            _set_restore_error(metadata, exc)
-            if raiseOnError:
-                _attach_restore_metadata(exc, metadata)
-                raise
-            return None, metadata
-
-        metadata["project"] = result.project
-        metadata["generation"] = result.generation
-        metadata["apiProjectId"] = result.project.apiProjectId
-        metadata["generationId"] = result.generation.generationId
-        metadata["stage"] = "generation"
-
-        try:
-            progress = self._parent.wait_for_generation(
-                generationId=result.generation.generationId,
-                apiProjectId=result.project.apiProjectId,
-                pollInterval=pollInterval,
-                timeout=timeout,
-                onProgress=onProgress,
-                showProgress=showProgress,
-                requestOptions=resolved_progress_options,
-            )
-        except Exception as exc:
-            metadata["stage"] = "progress"
-            progress = None
-            try:
-                progress = self._parent.get_generation_progress(
-                    generationId=result.generation.generationId,
-                    apiProjectId=result.project.apiProjectId,
-                    requestOptions=resolved_progress_options,
-                )
-            except Exception:
-                progress = None
-            metadata["progress"] = progress
-            metadata["status"] = getattr(progress, "status", None)
-            _set_restore_error(metadata, exc)
-            if progress is not None:
-                metadata["error"] = progress.error or str(exc)
-                metadata["errorDetails"] = progress.errorDetails
-                metadata["retryable"] = progress.retryable
-                metadata["warnings"] = progress.warnings
-            if raiseOnError:
-                _attach_restore_metadata(exc, metadata)
-                raise
-            return None, metadata
-
-        metadata["progress"] = progress
-        metadata["status"] = progress.status
-        metadata["error"] = progress.error
-        metadata["errorDetails"] = progress.errorDetails
-        metadata["retryable"] = progress.retryable
-        metadata["warnings"] = progress.warnings
-
-        metadata["stage"] = "download_info"
-        try:
-            download = self._parent.get_generation_download(
-                generationId=result.generation.generationId,
-                apiProjectId=result.project.apiProjectId,
-                downloadType=downloadType,
-                requestOptions=resolved_download_options,
-            )
-        except Exception as exc:
-            _set_restore_error(metadata, exc)
-            if raiseOnError:
-                _attach_restore_metadata(exc, metadata)
-                raise
-            return None, metadata
-
-        metadata["download"] = download
-        metadata["downloadType"] = download.downloadType
-        metadata["downloadUrl"] = download.downloadUrl
-        metadata["fileName"] = download.fileName
-        metadata["mimeType"] = download.mimeType
-
-        metadata["stage"] = "download"
-        try:
-            content = _download_binary(self._parent, download.downloadUrl, requestOptions=resolved_download_options)
-        except Exception as exc:
-            _set_restore_error(metadata, exc)
-            if raiseOnError:
-                _attach_restore_metadata(exc, metadata)
-                raise
-            return None, metadata
-
-        metadata["stage"] = "complete"
-        metadata["ok"] = True
-        return content, metadata
-
-    def restore(
-        self,
-        *,
-        filePath,
-        contentType=None,
-        contentLength=None,
-        fileFormat=None,
-        model=DEFAULT_MODEL_KEY,
-        sampling=None,
-        projectParams=None,
-        generationParams=None,
-        downloadType="audio",
-        pollInterval=2.0,
-        timeout=600.0,
-        onProgress=None,
-        showProgress=False,
-        requestOptions=None,
-        progressRequestOptions=None,
-        downloadRequestOptions=None,
-        raiseOnError=False,
-    ):
-        return self.restore_audio(
-            filePath=filePath,
-            contentType=contentType,
-            contentLength=contentLength,
-            fileFormat=fileFormat,
-            model=model,
-            sampling=sampling,
-            projectParams=projectParams,
-            generationParams=generationParams,
-            downloadType=downloadType,
-            pollInterval=pollInterval,
-            timeout=timeout,
-            onProgress=onProgress,
-            showProgress=showProgress,
-            requestOptions=requestOptions,
-            progressRequestOptions=progressRequestOptions,
-            downloadRequestOptions=downloadRequestOptions,
-            raiseOnError=raiseOnError,
-        )
-
-
-
-def _resolve_model_key(model):
-    """Return the Diffio 4.7 model key for model, warning on deprecated keys and rejecting unknown ones."""
-    if model in MODEL_ENDPOINTS:
-        return model
-    replacement = _DEPRECATED_MODEL_KEYS.get(model)
-    if replacement is None:
-        raise ValueError(
-            f"Unsupported model: {model}. Diffio 4.7 Flash and Diffio 4.7 Pro are the only models;"
-            " use diffio-4.7-flash or diffio-4.7-pro."
-        )
-    warnings.warn(
-        f"Model {model} is deprecated and now runs Diffio 4.7; use {replacement} instead.",
-        DeprecationWarning,
-        stacklevel=_caller_stacklevel(),
-    )
-    return replacement
-
-
-def _caller_stacklevel():
-    """Stack level of the first frame outside this package, so warnings point at the SDK caller."""
-    package_dir = os.path.dirname(os.path.abspath(__file__))
-    frame = sys._getframe(1)
-    level = 1
-    while frame is not None:
-        if os.path.dirname(os.path.abspath(frame.f_code.co_filename)) != package_dir:
-            return level
-        frame = frame.f_back
-        level += 1
-    return level
-
-
-def _guess_content_type(file_path):
-    guessed, _ = mimetypes.guess_type(file_path)
-    return guessed
-
-
-def _build_create_project_payload(
-    *,
-    filePath=None,
-    contentType=None,
-    contentLength=None,
-    params=None,
-    fileFormat=None,
-):
-    if filePath is None:
-        raise ValueError("filePath is required")
-
-    resolved_path = os.fspath(filePath)
-    if not resolved_path:
-        raise ValueError("filePath is required")
-
-    resolved_file_name = os.path.basename(resolved_path)
-    if not resolved_file_name:
-        raise ValueError("filePath must include a file name")
-
-    resolved_content_type = contentType or _guess_content_type(resolved_path) or "application/octet-stream"
-    resolved_content_length = contentLength
-    if resolved_content_length is None:
-        resolved_content_length = os.path.getsize(resolved_path)
-
-    payload = {
-        "fileName": resolved_file_name,
-        "contentType": resolved_content_type,
-        "contentLength": int(resolved_content_length),
-    }
-    if params:
-        payload["params"] = params
-    if fileFormat is not None:
-        payload["fileFormat"] = fileFormat
-
-    return payload
-
-
-def _plan_edge_upload_parts(size_bytes, part_size_bytes):
-    """Return (partNumber, startByte, endByte) per part, numbered from 1; an empty file is one empty part."""
-    if size_bytes == 0:
-        return [(1, 0, 0)]
-    parts = []
-    for index, start_byte in enumerate(range(0, size_bytes, part_size_bytes)):
-        parts.append((index + 1, start_byte, min(size_bytes, start_byte + part_size_bytes)))
-    return parts
-
-
-def _normalize_download_type(download_type):
-    if download_type is None:
-        return None, None
-    if download_type == "mp3":
-        return "audio", "mp3"
-    if download_type in {"audio", "video", "transcript"}:
-        return download_type, download_type
-    raise ValueError("downloadType must be audio, mp3, video, or transcript")
-
-
-def _extension_from_file_name(file_name):
-    if not file_name:
-        return None
-    extension = os.path.splitext(file_name)[1]
-    if extension:
-        return extension
-    return None
-
-
-def _extension_from_mime_type(mime_type):
-    if not mime_type:
-        return None
-    extension = mimetypes.guess_extension(mime_type)
-    if extension:
-        return extension
-    return None
-
-
-def _extension_from_url(download_url):
-    if not download_url:
-        return None
-    try:
-        parsed = urlparse(download_url)
-    except Exception:
-        return None
-    extension = os.path.splitext(parsed.path or "")[1]
-    if extension:
-        return extension
-    return None
-
-
-def _expected_download_extension(download):
-    if download.downloadType == "audio":
-        return ".mp3"
-    if download.downloadType == "transcript":
-        return ".json"
-    if download.downloadType == "video":
-        return (
-            _extension_from_file_name(download.fileName)
-            or _extension_from_mime_type(download.mimeType)
-            or _extension_from_url(download.downloadUrl)
-        )
-    return None
-
-
-def _warn_download_extension_mismatch(download, download_file_path):
-    expected_extension = _expected_download_extension(download)
-    if not expected_extension:
-        return
-    provided_extension = os.path.splitext(download_file_path)[1]
-    if provided_extension.lower() != expected_extension.lower():
-        warnings.warn(
-            "downloadFilePath should end with "
-            f"{expected_extension} for {download.downloadType} downloads. "
-            f"Received {download_file_path}.",
-            UserWarning,
-            stacklevel=2,
-        )
-
-
-def _is_storage_emulator_url(upload_url):
-    try:
-        parsed = urlparse(upload_url)
-    except Exception:
-        return False
-
-    host = (parsed.hostname or "").lower()
-    port = parsed.port
-    if host in {"127.0.0.1", "localhost", "0.0.0.0", "::1"} and (port == 9199 or port is None):
-        return True
-
-    emulator_host = os.environ.get("STORAGE_EMULATOR_HOST") or os.environ.get("FIREBASE_STORAGE_EMULATOR_HOST")
-    if not emulator_host:
-        return False
-    if not emulator_host.startswith(("http://", "https://")):
-        emulator_host = f"http://{emulator_host}"
-    try:
-        emulator_parsed = urlparse(emulator_host)
-    except Exception:
-        return False
-    if (parsed.hostname or "").lower() != (emulator_parsed.hostname or "").lower():
-        return False
-
-    parsed_port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    emulator_port = emulator_parsed.port or (443 if emulator_parsed.scheme == "https" else 80)
-    return parsed_port == emulator_port
-
-
-def _merge_headers(base_headers, override_headers):
-    headers = {}
-    if base_headers:
-        headers.update(base_headers)
-    if override_headers:
-        headers.update(override_headers)
-    return headers
-
-
-def _sleep_retry(attempt, retry_backoff):
-    if retry_backoff is None:
-        return
-    delay = retry_backoff * (2 ** attempt)
-    if delay > 0:
-        time.sleep(delay)
-
-
-def _raise_for_error(response):
-    if 200 <= response.status_code < 300:
-        content_type = response.headers.get("Content-Type", "")
-        if response.content and "application/json" in content_type:
-            return response.json()
-        return {}
-
-    message = f"Request failed with status {response.status_code}"
-    body = None
-    try:
-        if response.content:
-            body = response.json()
-            error = body.get("error") if isinstance(body, dict) else None
-            # The API answers {"error": "message"}; the edge Worker answers {"error": {"code", "message"}}.
-            if isinstance(error, dict):
-                message = str(error.get("message") or error.get("code") or message)
-            elif error:
-                message = str(error)
-        else:
-            body = None
-    except json.JSONDecodeError:
-        body = response.text
-
-    raise DiffioApiError(message, statusCode=response.status_code, responseBody=body)
-
-
-def _init_restore_metadata():
-    return {
-        "ok": False,
-        "stage": "start",
-        "apiProjectId": None,
-        "generationId": None,
-        "project": None,
-        "generation": None,
-        "progress": None,
-        "download": None,
-        "downloadType": None,
-        "downloadUrl": None,
-        "fileName": None,
-        "mimeType": None,
-        "status": None,
-        "error": None,
-        "errorDetails": None,
-        "retryable": None,
-        "warnings": [],
-        "exceptionType": None,
-        "exceptionMessage": None,
-        "statusCode": None,
-        "responseBody": None,
-    }
-
-
-def _set_restore_error(metadata, exc):
-    metadata["error"] = str(exc)
-    metadata["exceptionType"] = exc.__class__.__name__
-    metadata["exceptionMessage"] = str(exc)
-    if isinstance(exc, DiffioApiError):
-        metadata["statusCode"] = exc.statusCode
-        metadata["responseBody"] = exc.responseBody
-
-
-def _attach_restore_metadata(exc, metadata):
-    try:
-        setattr(exc, "restoreInfo", metadata)
-    except Exception:
-        return
-
-
-def _download_binary(parent, download_url, *, requestOptions=None):
-    merged_options = _merge_request_options(parent._default_request_options, requestOptions)
-    headers = {}
-    if _is_storage_emulator_url(download_url):
-        headers["Authorization"] = "Bearer owner"
-    headers = _merge_headers(headers, merged_options.headers)
-    timeout = merged_options.timeout
-    max_retries = merged_options.maxRetries if merged_options.maxRetries is not None else 0
-    retry_backoff = (
-        merged_options.retryBackoff if merged_options.retryBackoff is not None else DEFAULT_RETRY_BACKOFF
-    )
-    retry_statuses = (
-        merged_options.retryStatusCodes
-        if merged_options.retryStatusCodes is not None
-        else DEFAULT_RETRY_STATUS_CODES
-    )
-
-    attempt = 0
-    while True:
-        try:
-            request_kwargs = {
-                "method": "GET",
-                "url": download_url,
-                "headers": headers,
-            }
-            if timeout is not None:
-                request_kwargs["timeout"] = timeout
-            response = parent._client.request(**request_kwargs)
-        except httpx.RequestError:
-            if attempt >= max_retries:
-                raise
-            _sleep_retry(attempt, retry_backoff)
-            attempt += 1
-            continue
-
-        if retry_statuses and response.status_code in retry_statuses and attempt < max_retries:
-            response.close()
-            _sleep_retry(attempt, retry_backoff)
-            attempt += 1
-            continue
-
-        try:
-            if 200 <= response.status_code < 300:
-                return response.content
-            _raise_for_error(response)
+            if not 200 <= response.status_code < 300:
+                raise api_error_from_response(response)
+            return parse_json_response(response)
         finally:
             response.close()
 
-
-def _download_to_file(parent, download_url, file_path, *, requestOptions=None):
-    merged_options = _merge_request_options(parent._default_request_options, requestOptions)
-    headers = {}
-    if _is_storage_emulator_url(download_url):
-        headers["Authorization"] = "Bearer owner"
-    headers = _merge_headers(headers, merged_options.headers)
-    timeout = merged_options.timeout
-    max_retries = merged_options.maxRetries if merged_options.maxRetries is not None else 0
-    retry_backoff = (
-        merged_options.retryBackoff if merged_options.retryBackoff is not None else DEFAULT_RETRY_BACKOFF
-    )
-    retry_statuses = (
-        merged_options.retryStatusCodes
-        if merged_options.retryStatusCodes is not None
-        else DEFAULT_RETRY_STATUS_CODES
-    )
-
-    resolved_path = os.fspath(file_path)
-    directory = os.path.dirname(resolved_path) or "."
-    temp_handle = None
-    temp_path = None
-
-    try:
-        attempt = 0
-        while True:
-            try:
-                fd, temp_path = tempfile.mkstemp(prefix="diffio-download-", dir=directory)
-                temp_handle = os.fdopen(fd, "wb")
-                with parent._client.stream("GET", download_url, headers=headers, timeout=timeout) as response:
-                    if retry_statuses and response.status_code in retry_statuses and attempt < max_retries:
-                        temp_handle.close()
-                        try:
-                            os.remove(temp_path)
-                        except OSError:
-                            pass
-                        _sleep_retry(attempt, retry_backoff)
-                        attempt += 1
-                        continue
-                    if not (200 <= response.status_code < 300):
-                        temp_handle.close()
-                        try:
-                            os.remove(temp_path)
-                        except OSError:
-                            pass
-                        _raise_for_error(response)
-                    for chunk in response.iter_bytes():
-                        if chunk:
-                            temp_handle.write(chunk)
-                temp_handle.close()
-                temp_handle = None
-                os.replace(temp_path, resolved_path)
-                temp_path = None
-                return
-            except httpx.RequestError:
-                if temp_handle is not None:
-                    temp_handle.close()
-                    temp_handle = None
-                if temp_path is not None:
-                    try:
-                        os.remove(temp_path)
-                    except OSError:
-                        pass
-                    temp_path = None
-                if attempt >= max_retries:
-                    raise
-                _sleep_retry(attempt, retry_backoff)
-                attempt += 1
-                continue
-    finally:
-        if temp_handle is not None:
-            temp_handle.close()
-        if temp_path is not None:
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
-
-
-def _format_progress(progress):
-    parts = []
-    if progress.preProcessing is not None:
-        parts.append(f"pre={progress.preProcessing.status}:{progress.preProcessing.progress}%")
-    if progress.inference is not None:
-        parts.append(f"inf={progress.inference.status}:{progress.inference.progress}%")
-    if getattr(progress, "restoredVideo", None) is not None:
-        parts.append(f"vid={progress.restoredVideo.status}:{progress.restoredVideo.progress}%")
-    joined = ", ".join(parts)
-    if joined:
-        return f"{progress.status} ({joined})"
-    return f"{progress.status}"
-
-
-def _report_progress(progress, *, onProgress, showProgress):
-    if onProgress:
-        onProgress(progress)
-    if showProgress:
-        print(_format_progress(progress))
+    @staticmethod
+    def _new_idempotency_key():
+        return f"diffio-python-{uuid.uuid4().hex}"

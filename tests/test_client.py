@@ -1,1290 +1,727 @@
+import datetime
+import io
 import json
-import mimetypes
-from pathlib import Path
+import os
+import time
 
 import httpx
 import pytest
+from svix.webhooks import Webhook
 
-from diffio import CreateProjectResponse, DiffioClient, ModelKey
-from diffio.client import DEFAULT_MODEL_KEY, MODEL_ENDPOINTS, _plan_edge_upload_parts
-from diffio.errors import DiffioApiError
-from diffio_api_contract_fake import FakeDiffioApiContract
+import diffio
+from diffio import (
+    DiffioApiError,
+    DiffioClient,
+    DiffioError,
+    DiffioTimeoutError,
+    ExportFailedError,
+    Generation,
+    GenerationFailedError,
+    Page,
+    Project,
+    WebhookVerificationError,
+)
+from diffio.client import resolve_base_url
+from fake_api import API, EDGE, FakeDiffioApi
 
-
-def test_create_project_payload_and_headers(tmp_path: Path):
-    fake = FakeDiffioApiContract(apiKey="diffio_live_test")
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=fake.build_http_client())
-
-    file_path = tmp_path / "sample.wav"
-    file_path.write_bytes(b"RIFF-sample")
-    expected_content_type, _ = mimetypes.guess_type(str(file_path))
-    expected_content_type = expected_content_type or "application/octet-stream"
-
-    response = client.create_project(filePath=str(file_path), fileFormat="wav", params={"source": "test"})
-
-    create_request = fake.requests_for_path("/v1/create_project")[0]
-    payload = json.loads(create_request.content.decode("utf-8"))
-    assert create_request.headers["Authorization"] == "Bearer diffio_live_test"
-    assert payload == {
-        "fileName": "sample.wav",
-        "contentType": expected_content_type,
-        "contentLength": file_path.stat().st_size,
-        "params": {"source": "test"},
-        "fileFormat": "wav",
-    }
-    assert response.apiProjectId in fake.projects
-    assert response.upload.uploadSessionId == f"api-{response.apiProjectId}"
-    assert response.upload.expiresAt == "2026-10-08T12:00:00Z"
-    assert response.expiresAt == "2026-10-08T12:00:00Z"
-    assert response.uploadCompletion.apiProjectId == response.apiProjectId
+KEY = "diffio_test_key"
 
 
-def test_create_project_response_requires_upload_session():
-    with pytest.raises(ValueError, match="no upload session"):
-        CreateProjectResponse.from_dict({
-            "apiProjectId": "proj_legacy",
-            "uploadUrl": "https://storage.test/upload",
-            "objectPath": "users/u/projects/proj_legacy/original/input.wav",
-            "expiresAt": "2026-01-24T00:00:00Z",
-        })
+@pytest.fixture(autouse=True)
+def no_sleep(monkeypatch):
+    slept = []
+    monkeypatch.setattr(time, "sleep", lambda seconds: slept.append(seconds))
+    return slept
 
 
-def test_complete_project_upload_payload_and_response():
-    received = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        received["path"] = request.url.path
-        received["payload"] = json.loads(request.content.decode("utf-8"))
-        return httpx.Response(200, json={"apiProjectId": "proj_123", "status": "uploaded", "sizeBytes": 1234})
-
-    http_client = httpx.Client(base_url="https://api.test", transport=httpx.MockTransport(handler))
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    completion = client.projects.complete_upload(apiProjectId="proj_123")
-
-    assert received == {"path": "/v1/complete_project_upload", "payload": {"apiProjectId": "proj_123"}}
-    assert completion.status == "uploaded"
-    assert completion.sizeBytes == 1234
+@pytest.fixture
+def fake():
+    return FakeDiffioApi(api_key=KEY)
 
 
-def test_create_project_reports_missing_upload_from_completion(tmp_path: Path):
-    fake = FakeDiffioApiContract(apiKey="diffio_live_test")
-    original_complete = fake._complete_project_upload
+@pytest.fixture
+def client(fake):
+    return DiffioClient(KEY, base_url=API, http_client=fake.http_client())
 
-    def complete_before_storage(payload):
-        fake.storedObjects.clear()
-        return original_complete(payload)
 
-    fake._complete_project_upload = complete_before_storage
-    client = DiffioClient(apiKey="diffio_live_test", httpClient=fake.build_http_client())
-    file_path = tmp_path / "sample.wav"
-    file_path.write_bytes(b"RIFF")
+def body(request):
+    return json.loads(request.content) if request.content else None
 
+
+def ready_generation(client, fake, tmp_path, model="diffio-flash"):
+    audio = tmp_path / "clip.mp3"
+    audio.write_bytes(b"ID3" + b"x" * 100)
+    project = client.projects.create(file_name="clip.mp3", size_bytes=103, content_type="audio/mpeg")
+    client.projects.upload(project, audio)
+    generation = client.generations.create(project.id, model=model)
+    finished = client.generations.wait(project.id, generation.id)
+    return project, finished
+
+
+# ---- configuration -----------------------------------------------------------------------------------
+
+
+def test_base_url_defaults_to_production_v2(monkeypatch):
+    monkeypatch.delenv("DIFFIO_API_BASE_URL", raising=False)
+    assert resolve_base_url() == "https://api.diffio.ai/v2"
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("https://diffio-api-dev.web.app", "https://diffio-api-dev.web.app/v2"),
+    ("https://diffio-api-dev.web.app/", "https://diffio-api-dev.web.app/v2"),
+    ("https://diffio-api-dev.web.app/v2", "https://diffio-api-dev.web.app/v2"),
+    ("https://api.diffio.ai/v1", "https://api.diffio.ai/v2"),
+])
+def test_base_url_env_overrides_host(monkeypatch, value, expected):
+    monkeypatch.setenv("DIFFIO_API_BASE_URL", value)
+    assert DiffioClient("k").base_url == expected
+
+
+def test_api_key_comes_from_env(monkeypatch, fake):
+    monkeypatch.setenv("DIFFIO_API_KEY", KEY)
+    client = DiffioClient(base_url=API, http_client=fake.http_client())
+    client.projects.list()
+    assert fake.last().headers["Authorization"] == f"Bearer {KEY}"
+
+
+def test_requests_name_the_sdk(client, fake):
+    client.projects.list()
+    headers = fake.last().headers
+    assert headers["User-Agent"] == f"diffio-python/{diffio.__version__}"
+    assert headers["X-Diffio-SDK-Language"] == "Python"
+    assert headers["X-Diffio-SDK-Name"] == "diffio"
+    assert headers["X-Diffio-SDK-Version"] == diffio.__version__ == "1.0.0"
+
+
+def test_request_options_add_headers_and_override_key(fake):
+    client = DiffioClient("wrong", base_url=API, http_client=fake.http_client())
+    client.projects.list(request_options={"headers": {"X-Debug": "1"}, "api_key": KEY})
+    assert fake.last().headers["X-Debug"] == "1"
+    with pytest.raises(ValueError, match="Unknown request option"):
+        client.projects.list(request_options={"maxRetries": 1})
+
+
+def test_v1_methods_are_gone(client):
+    for name in ("create_project", "create_generation", "get_generation_progress", "get_generation_download",
+                 "list_projects", "audio_isolation", "account", "api_keys", "wait_for_generation"):
+        assert not hasattr(client, name)
+
+
+# ---- errors and retries --------------------------------------------------------------------------------
+
+
+def test_api_error_carries_code_message_request_id_and_details(client):
     with pytest.raises(DiffioApiError) as caught:
-        client.create_project(filePath=str(file_path))
+        client.projects.get("missing")
+    error = caught.value
+    assert error.status == 404
+    assert error.code == "project_not_found"
+    assert error.message == "No project has that id."
+    assert error.request_id == "req_fake"
+    assert error.details == {"project_id": "missing"}
+    assert "code=project_not_found" in str(error)
+    assert isinstance(error, DiffioError)
 
-    assert caught.value.statusCode == 409
-    assert caught.value.responseBody["code"] == "UPLOAD_MISSING"
+
+def test_missing_and_invalid_keys_are_typed(fake):
+    with pytest.raises(DiffioApiError) as missing:
+        DiffioClient(base_url=API, http_client=fake.http_client()).projects.list()
+    assert (missing.value.status, missing.value.code) == (401, "missing_api_key")
+    with pytest.raises(DiffioApiError) as invalid:
+        DiffioClient("nope", base_url=API, http_client=fake.http_client()).projects.list()
+    assert invalid.value.code == "invalid_api_key"
 
 
-def test_request_options_override_headers_and_api_key():
-    received = {}
+def test_get_retries_5xx_and_network_errors(client, fake, no_sleep):
+    fake.fail("GET", r"/v2/projects$", status=503, times=1)
+    fake.fail("GET", r"/v2/projects$", exc=httpx.ConnectError("boom"), times=1)
+    page = client.projects.list()
+    assert isinstance(page, Page)
+    assert len(fake.sent("GET", r"/v2/projects$")) == 3
+    assert no_sleep == [0.5, 1.0]
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        received["auth"] = request.headers.get("Authorization")
-        received["custom"] = request.headers.get("X-Test")
-        return httpx.Response(200, json={"projects": []})
 
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
+def test_retry_after_is_honoured(client, fake, no_sleep):
+    original = fake.handle
 
-    client.list_projects(
-        requestOptions={
-            "headers": {"X-Test": "present"},
-            "apiKey": "diffio_override",
-        }
+    def handle(request):
+        if request.method == "GET" and not fake.sent("GET"):
+            fake.requests.append(request)
+            return httpx.Response(429, headers={"Retry-After": "3"}, json={"error": {"code": "rate_limited", "message": "Slow down."}})
+        return original(request)
+
+    client._http = httpx.Client(transport=httpx.MockTransport(handle))
+    client.projects.list()
+    assert no_sleep == [3.0]
+
+
+def test_retries_stop_after_max_retries(fake):
+    client = DiffioClient(KEY, base_url=API, http_client=fake.http_client(), max_retries=1)
+    fake.fail("GET", r"/v2/usage", status=500, code="internal_error", times=5)
+    with pytest.raises(DiffioApiError) as caught:
+        client.usage.get()
+    assert caught.value.code == "internal_error"
+    assert len(fake.sent("GET", r"/v2/usage")) == 2
+
+
+def test_network_error_after_retries_is_a_connection_error(client, fake):
+    fake.fail("GET", r"/v2/usage", exc=httpx.ConnectError("down"), times=5)
+    with pytest.raises(DiffioApiError) as caught:
+        client.usage.get()
+    assert caught.value.code == "connection_error"
+    assert caught.value.status is None
+
+
+def test_post_without_idempotency_is_not_retried(client, fake, tmp_path):
+    project, generation = ready_generation(client, fake, tmp_path, model="diffio-pro")
+    fake.fail("POST", r"/assistant/turns$", status=503, times=1)
+    with pytest.raises(DiffioApiError):
+        client.assistant.create_turn(project.id, generation.id, messages=[{"role": "user", "content": "Tidy it"}])
+    assert len(fake.sent("POST", r"/assistant/turns$")) == 1
+
+
+# ---- models ------------------------------------------------------------------------------------------
+
+
+def test_models_list_needs_no_key(fake):
+    client = DiffioClient(base_url=API, http_client=fake.http_client(), end_user="customer-1")
+    models = client.models.list()
+    assert [m.id for m in models][:2] == ["diffio-4.7-flash", "diffio-4.7-pro"]
+    assert models.data[2].status == "alias" and models.data[2].served_by == "diffio-4.7-flash"
+    assert models.next_cursor is None
+    assert "Authorization" not in fake.last().headers
+    assert "Diffio-End-User" not in fake.last().headers
+
+
+# ---- projects ----------------------------------------------------------------------------------------
+
+
+def test_projects_create_sends_snake_case_body_and_headers(client, fake):
+    project = client.projects.create(
+        file_name="interview.mp3",
+        size_bytes=510957,
+        content_type="audio/mpeg",
+        metadata={"order_id": "1042"},
+        end_user="customer-42",
+        idempotency_key="order-1042",
     )
-
-    assert received["auth"] == "Bearer diffio_override"
-    assert received["custom"] == "present"
-
-
-def test_requests_identify_the_python_sdk():
-    import diffio
-
-    received = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        received.append(request.headers)
-        return httpx.Response(200, json={"projects": []})
-
-    http_client = httpx.Client(base_url="https://api.test", transport=httpx.MockTransport(handler))
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    client.list_projects()
-    client.list_projects(requestOptions={"headers": {"X-Test": "present"}})
-
-    for headers in received:
-        assert headers["User-Agent"] == f"diffio-python/{diffio.__version__}"
-        assert headers["X-Diffio-SDK-Language"] == "Python"
-        assert headers["X-Diffio-SDK-Name"] == "diffio"
-        assert headers["X-Diffio-SDK-Version"] == diffio.__version__
-    assert received[1]["X-Test"] == "present"
-
-
-def test_request_options_can_override_the_user_agent():
-    received = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        received["userAgent"] = request.headers.get("User-Agent")
-        return httpx.Response(200, json={"projects": []})
-
-    http_client = httpx.Client(base_url="https://api.test", transport=httpx.MockTransport(handler))
-    client = DiffioClient(
-        apiKey="diffio_live_test",
-        baseUrl="https://api.test",
-        httpClient=http_client,
-        requestOptions={"headers": {"User-Agent": "my-app/1.0"}},
-    )
-
-    client.list_projects()
-
-    assert received["userAgent"] == "my-app/1.0"
-
-
-def test_request_options_retries_on_status():
-    calls = {"count": 0}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls["count"] += 1
-        if calls["count"] == 1:
-            return httpx.Response(503, json={"error": "unavailable"})
-        return httpx.Response(200, json={"projects": []})
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    client.list_projects(
-        requestOptions={
-            "maxRetries": 1,
-            "retryBackoff": 0,
-        }
-    )
-
-    assert calls["count"] == 2
-
-
-def test_plan_edge_upload_parts_uses_fixed_part_size():
-    assert _plan_edge_upload_parts(0, 4) == [(1, 0, 0)]
-    assert _plan_edge_upload_parts(4, 4) == [(1, 0, 4)]
-    assert _plan_edge_upload_parts(9, 4) == [(1, 0, 4), (2, 4, 8), (3, 8, 9)]
-
-
-def test_edge_upload_forwards_custom_headers_but_only_the_upload_token(tmp_path: Path):
-    fake = FakeDiffioApiContract(apiKey="diffio_live_test")
-    client = DiffioClient(apiKey="diffio_live_test", httpClient=fake.build_http_client())
-    file_path = tmp_path / "test.wav"
-    file_path.write_bytes(b"RIFF")
-
-    project = client.create_project(
-        filePath=str(file_path),
-        requestOptions={"headers": {"X-Upload": "1"}},
-    )
-
-    edge_requests = [request for request in fake.requests if request.url.host == "media.test"]
-    assert edge_requests
-    for request in edge_requests:
-        assert request.headers["X-Upload"] == "1"
-        assert request.headers.get_list("Authorization") == [f"Bearer {project.upload.uploadToken}"]
-
-
-def test_wait_for_generation_reports_progress(monkeypatch):
-    progress_calls = []
-    status_sequence = ["queued", "processing", "complete"]
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/get_generation_progress":
-            status = status_sequence.pop(0)
-            return httpx.Response(
-                200,
-                json={
-                    "generationId": "gen_123",
-                    "apiProjectId": "proj_123",
-                    "status": status,
-                    "hasVideo": False,
-                    "preProcessing": {
-                        "jobId": "job-pre",
-                        "jobState": "SUCCEEDED",
-                        "status": "complete",
-                        "progress": 100,
-                        "statusMessage": None,
-                        "error": None,
-                        "errorDetails": None,
-                    },
-                    "inference": {
-                        "jobId": "job-run",
-                        "jobState": "RUNNING",
-                        "status": "running",
-                        "progress": 50,
-                        "statusMessage": None,
-                        "error": None,
-                        "errorDetails": None,
-                    },
-                },
-            )
-        return httpx.Response(404, json={"error": "not found"})
-
-    import diffio.client as client_module
-
-    monkeypatch.setattr(client_module.time, "sleep", lambda *_: None)
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    def on_progress(progress):
-        progress_calls.append(progress.status)
-
-    progress = client.generations.wait_for_complete(
-        generationId="gen_123",
-        apiProjectId="proj_123",
-        pollInterval=0.0,
-        timeout=5.0,
-        onProgress=on_progress,
-    )
-
-    assert progress.status == "complete"
-    assert progress_calls == ["queued", "processing", "complete"]
-
-
-def test_audio_isolation_isolate_runs_full_flow(tmp_path: Path):
-    fake = FakeDiffioApiContract(apiKey="diffio_live_test")
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=fake.build_http_client())
-
-    file_path = tmp_path / "input.wav"
-    file_path.write_bytes(b"test data")
-
-    result = client.audio_isolation.isolate(
-        filePath=str(file_path),
-        contentType="audio/wav",
-        model="diffio-4.7-pro",
-        sampling={"steps": 10},
-    )
-
-    assert result.project.apiProjectId in fake.projects
-    assert result.generation.modelKey == "diffio-4.7-pro"
-    assert fake.generations[result.generation.generationId]["sampling"] == {"steps": 10}
-    assert [(request.method, request.url.path) for request in fake.requests] == [
-        ("POST", "/v1/create_project"),
-        ("POST", "/v1/uploads/start"),
-        ("PUT", "/v1/uploads/parts/1"),
-        ("POST", "/v1/uploads/complete"),
-        ("POST", "/v1/complete_project_upload"),
-        ("POST", "/v1/diffio-4.7-pro-generation"),
-    ]
-
-
-def test_create_generation_routes_to_diffio_4_7_pro_endpoint():
-    received = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        received["path"] = request.url.path
-        payload = json.loads(request.content.decode("utf-8"))
-        received["payload"] = payload
-        return httpx.Response(
-            200,
-            json={
-                "generationId": "gen_47",
-                "apiProjectId": "proj_47",
-                "modelKey": "diffio-4.7-pro",
-                "status": "queued",
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    response = client.create_generation(apiProjectId="proj_47", model="diffio-4.7-pro")
-
-    assert received["path"] == "/v1/diffio-4.7-pro-generation"
-    assert received["payload"]["apiProjectId"] == "proj_47"
-    assert "idempotencyKey" not in received["payload"]
-    assert response.modelKey == "diffio-4.7-pro"
-    assert response.idempotentReplay is None
-
-
-def test_create_generation_sends_idempotency_key_and_parses_replay():
-    received = {}
-
-    def handler(request):
-        received["path"] = request.url.path
-        received["payload"] = json.loads(request.content.decode("utf-8"))
-        return httpx.Response(
-            200,
-            json={
-                "generationId": "gen_original",
-                "apiProjectId": "proj_123",
-                "modelKey": "diffio-4.7-flash",
-                "status": "queued",
-                "idempotentReplay": True,
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    response = client.create_generation(
-        apiProjectId="proj_123",
-        idempotencyKey="restore-job-2026-001",
-    )
-
-    assert received["path"] == "/v1/diffio-4.7-flash-generation"
-    assert received["payload"] == {
-        "apiProjectId": "proj_123",
-        "idempotencyKey": "restore-job-2026-001",
-    }
-    assert response.generationId == "gen_original"
-    assert response.idempotentReplay is True
-
-
-def test_generations_create_forwards_idempotency_key():
-    received = {}
-
-    def handler(request):
-        received["payload"] = json.loads(request.content.decode("utf-8"))
-        return httpx.Response(
-            200,
-            json={
-                "generationId": "gen_123",
-                "apiProjectId": "proj_123",
-                "modelKey": "diffio-4.7-flash",
-                "status": "queued",
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    response = client.generations.create(
-        apiProjectId="proj_123",
-        idempotencyKey="restore-job-2026-wrapper",
-    )
-
-    assert received["payload"]["idempotencyKey"] == "restore-job-2026-wrapper"
-    assert response.idempotentReplay is None
-
-
-def test_generations_create_and_wait_forwards_idempotency_key():
-    received = {}
-
-    def handler(request):
-        if request.url.path == "/v1/diffio-4.7-flash-generation":
-            received["createPayload"] = json.loads(request.content.decode("utf-8"))
-            return httpx.Response(
-                200,
-                json={
-                    "generationId": "gen_123",
-                    "apiProjectId": "proj_123",
-                    "modelKey": "diffio-4.7-flash",
-                    "status": "queued",
-                    "idempotentReplay": False,
-                },
-            )
-        if request.url.path == "/v1/get_generation_progress":
-            return httpx.Response(
-                200,
-                json={
-                    "generationId": "gen_123",
-                    "apiProjectId": "proj_123",
-                    "status": "complete",
-                    "hasVideo": False,
-                    "preProcessing": {
-                        "jobId": "job-pre",
-                        "jobState": "SUCCEEDED",
-                        "status": "complete",
-                        "progress": 100,
-                        "statusMessage": None,
-                        "error": None,
-                        "errorDetails": None,
-                    },
-                    "inference": {
-                        "jobId": "job-run",
-                        "jobState": "SUCCEEDED",
-                        "status": "complete",
-                        "progress": 100,
-                        "statusMessage": None,
-                        "error": None,
-                        "errorDetails": None,
-                    },
-                },
-            )
-        return httpx.Response(404, json={"error": "not found"})
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    generation, progress = client.generations.create_and_wait(
-        apiProjectId="proj_123",
-        idempotencyKey="restore-job-2026-002",
-        pollInterval=0,
-    )
-
-    assert received["createPayload"] == {
-        "apiProjectId": "proj_123",
-        "idempotencyKey": "restore-job-2026-002",
-    }
-    assert generation.idempotentReplay is False
-    assert progress.status == "complete"
-
-
-def test_advertised_models_match_runtime_model_support():
-    assert set(ModelKey) == set(MODEL_ENDPOINTS) == {"diffio-4.7-flash", "diffio-4.7-pro"}
-    assert MODEL_ENDPOINTS == {
-        "diffio-4.7-flash": "diffio-4.7-flash-generation",
-        "diffio-4.7-pro": "diffio-4.7-pro-generation",
-    }
-    assert DEFAULT_MODEL_KEY == "diffio-4.7-flash"
-
-
-def _recording_generation_client(received_paths):
-    def handler(request):
-        received_paths.append(request.url.path)
-        model_key = request.url.path[len("/v1/"):-len("-generation")]
-        return httpx.Response(200, json={"generationId": "gen_1", "apiProjectId": "proj_1",
-                                         "modelKey": model_key, "status": "queued"})
-
-    http_client = httpx.Client(base_url="https://api.test", transport=httpx.MockTransport(handler))
-    return DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-
-def test_create_generation_defaults_to_diffio_4_7_flash_endpoint():
-    received_paths = []
-    client = _recording_generation_client(received_paths)
-
-    response = client.create_generation(apiProjectId="proj_1")
-    wrapped = client.generations.create(apiProjectId="proj_1")
-
-    assert received_paths == ["/v1/diffio-4.7-flash-generation", "/v1/diffio-4.7-flash-generation"]
-    assert response.modelKey == wrapped.modelKey == "diffio-4.7-flash"
-
-
-@pytest.mark.parametrize("model, expectedPath", [
-    ("diffio-4.7-flash", "/v1/diffio-4.7-flash-generation"),
-    ("diffio-4.7-pro", "/v1/diffio-4.7-pro-generation"),
-])
-def test_create_generation_routes_4_7_models_to_their_endpoints(model, expectedPath):
-    received_paths = []
-    client = _recording_generation_client(received_paths)
-
-    response = client.create_generation(apiProjectId="proj_1", model=model)
-
-    assert received_paths == [expectedPath]
-    assert response.modelKey == model
-
-
-DEPRECATED_MODEL_CASES = [
-    ("diffio-4.6-flash", "/v1/diffio-4.7-flash-generation"),
-    ("diffio-4.6-pro", "/v1/diffio-4.7-pro-generation"),
-    ("diffio-4.5-flash", "/v1/diffio-4.7-flash-generation"),
-    ("diffio-4.5-pro", "/v1/diffio-4.7-pro-generation"),
-]
-
-
-@pytest.mark.parametrize("legacyModel, expectedPath", DEPRECATED_MODEL_CASES)
-def test_create_generation_routes_deprecated_model_keys_to_matching_4_7_endpoint(legacyModel, expectedPath):
-    received_paths = []
-    client = _recording_generation_client(received_paths)
-
-    with pytest.warns(DeprecationWarning) as direct:
-        response = client.create_generation(apiProjectId="proj_1", model=legacyModel)
-    with pytest.warns(DeprecationWarning) as wrapped_warnings:
-        wrapped = client.generations.create(apiProjectId="proj_1", model=legacyModel)
-
-    assert received_paths == [expectedPath, expectedPath]
-    assert response.modelKey == wrapped.modelKey == expectedPath[len("/v1/"):-len("-generation")]
-    replacement = expectedPath[len("/v1/"):-len("-generation")]
-    for record in list(direct) + list(wrapped_warnings):
-        assert str(record.message) == (
-            f"Model {legacyModel} is deprecated and now runs Diffio 4.7; use {replacement} instead."
-        )
-        # stacklevel points at the SDK caller, not at SDK internals.
-        assert record.filename == __file__
-    assert len(direct) == len(wrapped_warnings) == 1
-    assert legacyModel not in ModelKey
-
-
-def test_current_models_do_not_warn(recwarn):
-    received_paths = []
-    client = _recording_generation_client(received_paths)
-
-    client.create_generation(apiProjectId="proj_1")
-    client.create_generation(apiProjectId="proj_1", model="diffio-4.7-pro")
-
-    assert [record for record in recwarn if issubclass(record.category, DeprecationWarning)] == []
-
-
-@pytest.mark.parametrize("legacyModel, expectedPath", DEPRECATED_MODEL_CASES)
-def test_audio_isolation_warns_once_for_deprecated_model_at_caller(tmp_path, legacyModel, expectedPath):
-    fake = FakeDiffioApiContract(apiKey="diffio_live_test")
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=fake.build_http_client())
-    file_path = tmp_path / "input.wav"
-    file_path.write_bytes(b"test data")
-
-    with pytest.warns(DeprecationWarning) as records:
-        result = client.audio_isolation.isolate(filePath=str(file_path), contentType="audio/wav", model=legacyModel)
-
-    assert len(records) == 1
-    assert records[0].filename == __file__
-    assert fake.requests[-1].url.path == expectedPath
-    assert result.generation.modelKey == expectedPath[len("/v1/"):-len("-generation")]
-
-
-@pytest.mark.parametrize("unknownModel", [
-    "diffio-4.0-flash", "diffio-4.5", "diffio-4.6", "diffio-4.7", "diffio-4.7-ultra", "diffio-4.8-flash", "", None,
-])
-def test_create_generation_rejects_unknown_models_naming_4_7(unknownModel):
-    received_paths = []
-    client = _recording_generation_client(received_paths)
-
-    with pytest.raises(ValueError, match="Unsupported model: .*use diffio-4.7-flash or diffio-4.7-pro"):
-        client.create_generation(apiProjectId="proj_1", model=unknownModel)
-
-    assert received_paths == []
-
-
-def test_existing_generations_with_retired_models_still_parse(tmp_path: Path):
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/list_project_generations":
-            return httpx.Response(200, json={
-                "apiProjectId": "proj_old",
-                "generations": [
-                    {"generationId": "gen_old", "status": "complete", "modelKey": "diffio-2",
-                     "progress": 100, "createdAt": None, "updatedAt": None},
-                    {"generationId": "gen_old_35", "status": "complete", "modelKey": "diffio-3.5",
-                     "progress": 100, "createdAt": None, "updatedAt": None},
-                ],
-            })
-        if request.url.path == "/v1/get_generation_download":
-            return httpx.Response(200, json={
-                "generationId": "gen_old",
-                "apiProjectId": "proj_old",
-                "downloadType": "audio",
-                "downloadUrl": "https://media.test/m/token/generations/gen_old/restored.mp3",
-                "fileName": "diffio_ai_old.mp3",
-                "storagePath": "api/users/u/projects/proj_old/generations/gen_old/restored.mp3",
-                "mimeType": "audio/mpeg",
-            })
-        if request.url.host == "media.test":
-            return httpx.Response(200, content=b"old-restored-audio")
-        return httpx.Response(404, json={"error": "not found"})
-
-    http_client = httpx.Client(base_url="https://api.test", transport=httpx.MockTransport(handler))
-    client = DiffioClient(apiKey="diffio_live_test", httpClient=http_client)
-
-    generations = client.projects.list_generations(apiProjectId="proj_old")
-    download_path = tmp_path / "old.mp3"
-    download = client.generations.download(generationId="gen_old", apiProjectId="proj_old",
-                                           downloadFilePath=str(download_path))
-
-    assert [generation.modelKey for generation in generations.generations] == ["diffio-2", "diffio-3.5"]
-    assert download.fileName == "diffio_ai_old.mp3"
-    assert download_path.read_bytes() == b"old-restored-audio"
-
-
-@pytest.mark.parametrize("transcription_status", [None, "pending", "available", "unavailable"])
-def test_restore_audio_runs_full_flow_and_downloads(tmp_path, monkeypatch, transcription_status):
-    status_sequence = ["queued", "processing", "complete"]
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/create_project":
-            payload = json.loads(request.content.decode("utf-8"))
-            assert payload["fileName"] == "input.wav"
-            return httpx.Response(
-                200,
-                json={
-                    "apiProjectId": "proj_abc",
-                    "upload": {
-                        "uploadSessionId": "api-proj_abc",
-                        "edgeBaseUrl": "https://upload.test/",
-                        "uploadToken": "v1.upload.sig",
-                        "objectKey": "api/users/u/projects/proj_abc/original/input.wav",
-                        "partSizeBytes": 33554432,
-                        "maxBytes": 2147483648,
-                        "expiresAt": "2026-01-24T00:00:00Z",
-                    },
-                    "objectPath": "api/users/u/projects/proj_abc/original/input.wav",
-                    "expiresAt": "2026-01-24T00:00:00Z",
-                },
-            )
-
-        if request.url.host == "upload.test":
-            assert request.headers.get("Authorization") == "Bearer v1.upload.sig"
-            if request.url.path == "/v1/uploads/start":
-                return httpx.Response(200, json={"uploadId": "up_1", "partSizeBytes": 33554432,
-                                                 "maxBytes": 2147483648})
-            if request.url.path == "/v1/uploads/parts/1":
-                assert request.url.params["uploadId"] == "up_1"
-                assert request.content == b"test data"
-                return httpx.Response(200, json={"partNumber": 1, "etag": "etag-1"})
-            if request.url.path == "/v1/uploads/complete":
-                assert json.loads(request.content) == {"uploadId": "up_1",
-                                                       "parts": [{"partNumber": 1, "etag": "etag-1"}]}
-                return httpx.Response(200, json={"objectKey": "k", "sizeBytes": 9, "etag": "e"})
-
-        if request.url.path == "/v1/complete_project_upload":
-            return httpx.Response(200, json={"apiProjectId": "proj_abc", "status": "uploaded", "sizeBytes": 9})
-
-        if request.url.path == "/v1/diffio-4.7-flash-generation":
-            payload = json.loads(request.content.decode("utf-8"))
-            assert payload["apiProjectId"] == "proj_abc"
-            assert payload["sampling"]["steps"] == 10
-            return httpx.Response(
-                200,
-                json={
-                    "generationId": "gen_123",
-                    "apiProjectId": "proj_abc",
-                    "modelKey": "diffio-4.7-flash",
-                    "status": "queued",
-                },
-            )
-
-        if request.url.path == "/v1/get_generation_progress":
-            status = status_sequence.pop(0)
-            return httpx.Response(
-                200,
-                json={
-                    **({"transcription": {"status": transcription_status}} if transcription_status else {}),
-                    "generationId": "gen_123",
-                    "apiProjectId": "proj_abc",
-                    "status": status,
-                    "hasVideo": False,
-                    "preProcessing": {
-                        "jobId": "job-pre",
-                        "jobState": "SUCCEEDED",
-                        "status": "complete",
-                        "progress": 100,
-                        "statusMessage": None,
-                        "error": None,
-                        "errorDetails": None,
-                    },
-                    "inference": {
-                        "jobId": "job-run",
-                        "jobState": "RUNNING",
-                        "status": "running",
-                        "progress": 50,
-                        "statusMessage": None,
-                        "error": None,
-                        "errorDetails": None,
-                    },
-                },
-            )
-
-        if request.url.path == "/v1/get_generation_download":
-            payload = json.loads(request.content.decode("utf-8"))
-            assert payload["apiProjectId"] == "proj_abc"
-            assert payload["downloadType"] == "audio"
-            return httpx.Response(
-                200,
-                json={
-                    "generationId": "gen_123",
-                    "apiProjectId": "proj_abc",
-                    "downloadType": "audio",
-                    "downloadUrl": "https://download.test/output.mp3",
-                    "fileName": "diffio_ai_input.mp3",
-                    "storagePath": "users/u/projects/proj_abc/generations/gen_123/restored.mp3",
-                    "mimeType": "audio/mpeg",
-                },
-            )
-
-        if request.url.host == "download.test":
-            return httpx.Response(200, content=b"restored-audio", headers={"Content-Type": "audio/mpeg"})
-
-        return httpx.Response(404, json={"error": "not found"})
-
-    import diffio.client as client_module
-
-    monkeypatch.setattr(client_module.time, "sleep", lambda *_: None)
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    file_path = tmp_path / "input.wav"
-    file_path.write_bytes(b"test data")
-
-    content, info = client.restore_audio(
-        filePath=str(file_path),
-        contentType="audio/wav",
-        model="diffio-4.7-flash",
-        sampling={"steps": 10},
-        pollInterval=0.0,
-    )
-
-    assert content == b"restored-audio"
-    assert info["apiProjectId"] == "proj_abc"
-    assert info["generationId"] == "gen_123"
-    assert info["status"] == "complete"
-    assert info["downloadUrl"] == "https://download.test/output.mp3"
-    assert info["error"] is None
-    assert info["ok"] is True
-    assert info["statusCode"] is None
-    assert info["responseBody"] is None
-    if transcription_status is None:
-        assert info["progress"].transcription is None
-    else:
-        assert info["progress"].transcription.status == transcription_status
-
-
-def test_create_generation_rejects_unknown_model():
-    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={}))
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
+    request = fake.last("POST", r"/v2/projects$")
+    assert body(request) == {"file_name": "interview.mp3", "content_type": "audio/mpeg", "size_bytes": 510957,
+                             "metadata": {"order_id": "1042"}}
+    assert request.headers["Idempotency-Key"] == "order-1042"
+    assert request.headers["Diffio-End-User"] == "customer-42"
+    assert request.headers["Content-Type"] == "application/json"
+    assert isinstance(project, Project)
+    assert project.status == "awaiting_upload"
+    assert project.end_user == "customer-42"
+    assert project.upload.part_size_bytes == 32 * 1024 * 1024
+    assert project.upload.requests["part"].method == "PUT"
+    replay = client.projects.create(file_name="interview.mp3", size_bytes=510957, content_type="audio/mpeg",
+                                    metadata={"order_id": "1042"}, end_user="customer-42", idempotency_key="order-1042")
+    assert replay.id == project.id
+    with pytest.raises(DiffioApiError) as conflict:
+        client.projects.create(file_name="other.mp3", end_user="customer-42", idempotency_key="order-1042")
+    assert conflict.value.code == "idempotency_key_conflict"
+
+
+def test_projects_create_sends_its_own_idempotency_key_and_retries_with_it(client, fake):
+    fake.fail("POST", r"/v2/projects$", status=503, times=1)
+    project = client.projects.create(file_name="a.wav", generation="diffio-pro")
+    sent = fake.sent("POST", r"/v2/projects$")
+    assert len(sent) == 2
+    assert sent[0].headers["Idempotency-Key"].startswith("diffio-python-")
+    assert sent[0].headers["Idempotency-Key"] == sent[1].headers["Idempotency-Key"]
+    assert body(sent[1])["generation"] == {"model": "diffio-pro"}
+    assert project.latest_generation.status == "queued"
+    assert project.generation_count == 1
+
+
+def test_client_end_user_is_sent_and_a_call_can_override_it(fake):
+    client = DiffioClient(KEY, base_url=API, http_client=fake.http_client(), end_user="customer-1")
+    client.projects.create(file_name="a.mp3")
+    assert fake.last().headers["Diffio-End-User"] == "customer-1"
+    client.projects.list(end_user="customer-2")
+    assert fake.last().headers["Diffio-End-User"] == "customer-2"
+
+
+def test_projects_create_requires_file_name(client):
     with pytest.raises(ValueError):
-        client.create_generation(apiProjectId="proj", model="diffio-unknown")
+        client.projects.create(file_name="")
 
 
-def test_create_generation_rejects_diffio_3():
-    def handler(request):
-        raise AssertionError("Unsupported models must be rejected before an HTTP request")
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    with pytest.raises(ValueError, match="Unsupported model: diffio-3"):
-        client.create_generation(apiProjectId="proj", model="diffio-3")
-
-
-def test_get_generation_progress_payload_and_response():
-    received = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        received["path"] = request.url.path
-        payload = json.loads(request.content.decode("utf-8"))
-        received["payload"] = payload
-        return httpx.Response(
-            200,
-            json={
-                "generationId": "gen_123",
-                "apiProjectId": "proj_123",
-                "status": "processing",
-                "hasVideo": False,
-                "preProcessing": {
-                    "jobId": "job-pre",
-                    "jobState": "SUCCEEDED",
-                    "status": "complete",
-                    "progress": 100,
-                    "statusMessage": None,
-                    "error": None,
-                    "errorDetails": None,
-                },
-                "inference": {
-                    "jobId": "job-run",
-                    "jobState": "RUNNING",
-                    "status": "running",
-                    "progress": 40,
-                    "statusMessage": "Processing audio",
-                    "error": None,
-                    "errorDetails": None,
-                },
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    progress = client.generations.get_progress(generationId="gen_123", apiProjectId="proj_123")
-
-    assert received["path"] == "/v1/get_generation_progress"
-    assert received["payload"]["generationId"] == "gen_123"
-    assert received["payload"]["apiProjectId"] == "proj_123"
-    assert progress.status == "processing"
-    assert progress.preProcessing.status == "complete"
-    assert progress.inference.progress == 40
-    assert progress.restoredVideo is None
+def test_upload_follows_the_upload_requests_and_completes(client, fake, tmp_path):
+    audio = tmp_path / "clip.mp3"
+    audio.write_bytes(b"ID3" + bytes(range(256)) * 4)
+    project = client.projects.create(file_name="clip.mp3", size_bytes=audio.stat().st_size)
+    ready = client.projects.upload(project, audio)
+    assert fake.objects[project.id] == audio.read_bytes()
+    edge = [r for r in fake.requests if str(r.url).startswith(EDGE)]
+    assert [(r.method, r.url.path) for r in edge] == [
+        ("POST", "/v1/uploads/start"), ("PUT", "/v1/uploads/parts/1"), ("POST", "/v1/uploads/complete")]
+    for request in edge:
+        assert request.headers["Authorization"] == f"Bearer {project.upload.upload_token}"
+        assert KEY not in request.headers["Authorization"]
+    assert edge[1].headers["Content-Length"] == str(audio.stat().st_size)
+    assert body(edge[2]) == {"uploadId": edge[1].url.params["uploadId"], "parts": [{"partNumber": 1, "etag": "etag-1"}]}
+    assert fake.last("POST", r"/upload/complete$") is not None
+    assert ready.status == "ready"
 
 
-def test_get_generation_download_payload_and_response():
-    received = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        received["path"] = request.url.path
-        payload = json.loads(request.content.decode("utf-8"))
-        received["payload"] = payload
-        return httpx.Response(
-            200,
-            json={
-                "generationId": "gen_456",
-                "apiProjectId": "proj_456",
-                "downloadType": "audio",
-                "downloadUrl": "https://storage.test/download",
-                "fileName": "diffio_ai_input.wav",
-                "storagePath": "users/u/projects/proj_456/generations/gen_456/restored.mp3",
-                "mimeType": "audio/mpeg",
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    download = client.generations.get_download(
-        generationId="gen_456",
-        apiProjectId="proj_456",
-        downloadType="mp3",
-    )
-
-    assert received["path"] == "/v1/get_generation_download"
-    assert received["payload"]["generationId"] == "gen_456"
-    assert received["payload"]["apiProjectId"] == "proj_456"
-    assert received["payload"]["downloadType"] == "audio"
-    assert download.downloadUrl == "https://storage.test/download"
-    assert download.fileName == "diffio_ai_input.wav"
-    assert download.mimeType == "audio/mpeg"
+def test_upload_splits_into_parts_of_the_announced_size(fake, tmp_path):
+    fake.part_size = 10
+    client = DiffioClient(KEY, base_url=API, http_client=fake.http_client())
+    data = bytes(range(25))
+    project = client.projects.create(file_name="clip.wav")
+    client.projects.upload(project, data)
+    parts = fake.sent("PUT", r"/v1/uploads/parts/")
+    assert [len(r.content) for r in parts] == [10, 10, 5]
+    assert fake.objects[project.id] == data
+    assert [p["partNumber"] for p in body(fake.last("POST", r"/v1/uploads/complete"))["parts"]] == [1, 2, 3]
 
 
-def test_get_generation_download_accepts_transcript():
-    received = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        received["path"] = request.url.path
-        payload = json.loads(request.content.decode("utf-8"))
-        received["payload"] = payload
-        return httpx.Response(
-            200,
-            json={
-                "generationId": "gen_456",
-                "apiProjectId": "proj_456",
-                "downloadType": "transcript",
-                "downloadUrl": "https://storage.test/word_timestamps.json",
-                "fileName": "word_timestamps.json",
-                "storagePath": "users/u/projects/proj_456/generations/gen_456/word_timestamps.json",
-                "mimeType": "application/json",
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    download = client.generations.get_download(
-        generationId="gen_456",
-        apiProjectId="proj_456",
-        downloadType="transcript",
-    )
-
-    assert received["path"] == "/v1/get_generation_download"
-    assert received["payload"]["downloadType"] == "transcript"
-    assert download.downloadType == "transcript"
-    assert download.mimeType == "application/json"
+def test_upload_of_an_exact_multiple_sends_no_empty_tail(fake):
+    fake.part_size = 10
+    client = DiffioClient(KEY, base_url=API, http_client=fake.http_client())
+    project = client.projects.create(file_name="clip.wav")
+    client.projects.upload(project, bytes(20))
+    assert [len(r.content) for r in fake.sent("PUT", r"/parts/")] == [10, 10]
 
 
-def test_generation_download_writes_file(tmp_path: Path):
-    received = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/get_generation_download":
-            payload = json.loads(request.content.decode("utf-8"))
-            received["payload"] = payload
-            return httpx.Response(
-                200,
-                json={
-                    "generationId": "gen_789",
-                    "apiProjectId": "proj_789",
-                    "downloadType": "audio",
-                    "downloadUrl": "https://download.test/restored.mp3",
-                    "fileName": "restored.mp3",
-                    "storagePath": "users/u/projects/proj_789/generations/gen_789/restored.mp3",
-                    "mimeType": "audio/mpeg",
-                },
-            )
-        if request.url.host == "download.test":
-            return httpx.Response(200, content=b"mp3-bytes")
-        return httpx.Response(404, json={"error": "not found"})
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    output_path = tmp_path / "restored.mp3"
-    download = client.generations.download(
-        generationId="gen_789",
-        apiProjectId="proj_789",
-        downloadType="audio",
-        downloadFilePath=str(output_path),
-    )
-
-    assert received["payload"]["downloadType"] == "audio"
-    assert download.downloadUrl == "https://download.test/restored.mp3"
-    assert output_path.read_bytes() == b"mp3-bytes"
+def test_upload_accepts_a_binary_file_object(client, fake):
+    project = client.projects.create(file_name="clip.wav")
+    client.projects.upload(project, io.BytesIO(b"RIFF-data"))
+    assert fake.objects[project.id] == b"RIFF-data"
+    with pytest.raises(ValueError, match="binary"):
+        client.projects.upload(client.projects.create(file_name="b.wav"), io.StringIO("text"))
 
 
-def test_generation_download_warns_on_extension_mismatch(tmp_path: Path):
-    received = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/get_generation_download":
-            payload = json.loads(request.content.decode("utf-8"))
-            received["payload"] = payload
-            return httpx.Response(
-                200,
-                json={
-                    "generationId": "gen_111",
-                    "apiProjectId": "proj_111",
-                    "downloadType": "audio",
-                    "downloadUrl": "https://download.test/restored.mp3",
-                    "fileName": "restored.mp3",
-                    "storagePath": "users/u/projects/proj_111/generations/gen_111/restored.mp3",
-                    "mimeType": "audio/mpeg",
-                },
-            )
-        if request.url.host == "download.test":
-            return httpx.Response(200, content=b"mp3-bytes")
-        return httpx.Response(404, json={"error": "not found"})
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    output_path = tmp_path / "restored.wav"
-    with pytest.warns(UserWarning, match="downloadFilePath should end with"):
-        client.generations.download(
-            generationId="gen_111",
-            apiProjectId="proj_111",
-            downloadType="mp3",
-            downloadFilePath=str(output_path),
-        )
-
-    assert received["payload"]["downloadType"] == "audio"
-    assert output_path.read_bytes() == b"mp3-bytes"
+def test_upload_retries_only_the_failed_part(fake):
+    fake.part_size = 4
+    client = DiffioClient(KEY, base_url=API, http_client=fake.http_client())
+    project = client.projects.create(file_name="clip.wav")
+    fake.fail("PUT", r"/parts/2\?", status=503, times=1)
+    client.projects.upload(project, b"aaaabbbbcc")
+    numbers = [r.url.path.rsplit("/", 1)[1] for r in fake.sent("PUT", r"/parts/")]
+    assert numbers == ["1", "2", "2", "3"]
+    assert fake.objects[project.id] == b"aaaabbbbcc"
 
 
-def test_list_projects_payload_and_response():
-    received = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        received["path"] = request.url.path
-        received["auth"] = request.headers.get("Authorization")
-        payload = json.loads(request.content.decode("utf-8"))
-        received["payload"] = payload
-        return httpx.Response(
-            200,
-            json={
-                "projects": [
-                    {
-                        "apiProjectId": "proj_123",
-                        "status": "uploaded",
-                        "originalFileName": "song.wav",
-                        "contentType": "audio/wav",
-                        "hasVideo": False,
-                        "generationCount": 2,
-                        "createdAt": "2026-01-05T12:34:56Z",
-                        "updatedAt": "2026-01-05T12:35:10Z",
-                    }
-                ]
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    response = client.projects.list()
-
-    assert received["path"] == "/v1/list_projects"
-    assert received["auth"] == "Bearer diffio_live_test"
-    assert received["payload"] == {}
-    assert response.projects[0].apiProjectId == "proj_123"
-    assert response.projects[0].generationCount == 2
-    assert response.projects[0].hasVideo is False
+def test_upload_aborts_when_a_part_keeps_failing(client, fake):
+    project = client.projects.create(file_name="clip.wav")
+    fake.fail("PUT", r"/parts/1\?", status=500, code="internal_error", times=10)
+    with pytest.raises(DiffioApiError):
+        client.projects.upload(project, b"data")
+    assert fake.uploads[project.id]["aborted"] is True
+    assert fake.last("POST", r"/upload/complete$") is None
 
 
-def test_list_project_generations_payload_and_response():
-    received = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        received["path"] = request.url.path
-        payload = json.loads(request.content.decode("utf-8"))
-        received["payload"] = payload
-        return httpx.Response(
-            200,
-            json={
-                "apiProjectId": "proj_123",
-                "generations": [
-                    {
-                        "generationId": "gen_123",
-                        "status": "processing",
-                        "modelKey": "diffio-4.7-flash",
-                        "progress": None,
-                        "createdAt": "2026-01-05T12:40:00Z",
-                        "updatedAt": "2026-01-05T12:41:00Z",
-                    }
-                ],
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    response = client.projects.list_generations(apiProjectId="proj_123")
-
-    assert received["path"] == "/v1/list_project_generations"
-    assert received["payload"]["apiProjectId"] == "proj_123"
-    assert response.apiProjectId == "proj_123"
-    assert response.generations[0].generationId == "gen_123"
-    assert response.generations[0].progress is None
+def test_upload_refuses_a_file_over_max_bytes_before_sending(client, fake):
+    project = client.projects.create(file_name="clip.wav")
+    project.upload._data["max_bytes"] = 3
+    object.__setattr__(project.upload, "max_bytes", 3)
+    with pytest.raises(ValueError, match="upload limit"):
+        client.projects.upload(project, b"four")
+    assert not fake.sent(pattern=EDGE)
 
 
-def test_webhooks_send_test_event_payload_and_response():
-    received = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        received["path"] = request.url.path
-        payload = json.loads(request.content.decode("utf-8"))
-        received["payload"] = payload
-        return httpx.Response(
-            200,
-            json={
-                "svixMessageId": "msg_123",
-                "eventId": "evt_123",
-                "eventType": "generation.completed",
-                "mode": "live",
-                "apiKeyId": "key_123",
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    response = client.webhooks.send_test_event(
-        eventType="generation.completed",
-        mode="live",
-        apiKeyId="key_123",
-        samplePayload={"apiProjectId": "proj_123"},
-    )
-
-    assert received["path"] == "/v1/webhooks/send_test_event"
-    assert received["payload"]["eventType"] == "generation.completed"
-    assert received["payload"]["mode"] == "live"
-    assert received["payload"]["apiKeyId"] == "key_123"
-    assert received["payload"]["samplePayload"]["apiProjectId"] == "proj_123"
-    assert response.svixMessageId == "msg_123"
-    assert response.eventId == "evt_123"
-    assert response.eventType == "generation.completed"
+def test_upload_by_project_id_reopens_the_upload(client, fake):
+    project = client.projects.create(file_name="clip.wav")
+    result = client.projects.upload(project.id, b"bytes", complete=False)
+    assert result is None
+    assert fake.last("POST", r"/upload$") is not None
+    assert fake.last("POST", r"/upload/complete$") is None
+    assert fake.objects[project.id] == b"bytes"
 
 
-def test_account_keys_usage_and_webhook_configure_endpoints():
-    calls = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        payload = json.loads(request.content.decode("utf-8"))
-        calls.append((request.url.path, payload))
-        if request.url.path == "/v1/account/settings/get":
-            return httpx.Response(
-                200,
-                json={
-                    "apiKeyId": "agent_1",
-                    "account": {"userId": "user_1", "billingPolicy": {"type": "internalDiffio"}},
-                },
-            )
-        if request.url.path == "/v1/api_keys/create":
-            return httpx.Response(
-                200,
-                json={
-                    "key": "diffio_live_new",
-                    "keyId": "key_1",
-                    "label": "VFC worker",
-                    "status": "active",
-                    "keyPrefix": "diffio_live_",
-                    "role": "scoped",
-                    "scopes": ["projects:read", "projects:write"],
-                    "resourceBounds": {},
-                    "parentKeyId": "agent_1",
-                },
-            )
-        if request.url.path == "/v1/usage/summary":
-            return httpx.Response(
-                200,
-                json={
-                    "usage": {"apiKeyId": "key_1", "periods": []},
-                    "billing": {"billingPolicy": {"type": "internalDiffio"}},
-                },
-            )
-        if request.url.path == "/v1/webhooks/configure":
-            return httpx.Response(
-                200,
-                json={
-                    "webhook": {
-                        "apiKeyId": "key_1",
-                        "mode": "live",
-                        "endpointId": "ep_1",
-                    }
-                },
-            )
-        return httpx.Response(404, json={"error": "not found"})
-
-    transport = httpx.MockTransport(handler)
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
-
-    settings = client.account.get_settings()
-    key = client.api_keys.create(label="VFC worker", scopes=["projects:read", "projects:write"])
-    usage = client.usage.summary(apiKeyId="key_1")
-    webhook = client.webhooks.configure(
-        mode="live",
-        url="https://example.com/webhook",
-        eventTypes=["generation.completed"],
-        apiKeyId="key_1",
-    )
-
-    assert settings.account["billingPolicy"]["type"] == "internalDiffio"
-    assert key.key == "diffio_live_new"
-    assert usage.billing["billingPolicy"]["type"] == "internalDiffio"
-    assert webhook.webhook["endpointId"] == "ep_1"
-    assert calls[1] == (
-        "/v1/api_keys/create",
-        {"label": "VFC worker", "scopes": ["projects:read", "projects:write"], "resourceBounds": {}},
-    )
+def test_upload_without_requests_uses_the_documented_recipe(client, fake):
+    fake.omit_upload_requests = True
+    project = client.projects.create(file_name="clip.wav")
+    assert project.upload.requests is None
+    client.projects.upload(project, b"bytes")
+    assert fake.objects[project.id] == b"bytes"
 
 
-def test_webhooks_send_test_event_rejects_invalid_type():
-    transport = httpx.MockTransport(lambda request: httpx.Response(200, json={}))
-    http_client = httpx.Client(base_url="https://api.test", transport=transport)
-    client = DiffioClient(apiKey="diffio_live_test", baseUrl="https://api.test", httpClient=http_client)
+def test_reopen_upload_and_its_refusal(client, fake):
+    project = client.projects.create(file_name="clip.wav")
+    reopened = client.projects.reopen_upload(project.id)
+    assert reopened.upload.upload_token != project.upload.upload_token
+    client.projects.upload(reopened, b"x")
+    with pytest.raises(DiffioApiError) as caught:
+        client.projects.reopen_upload(project.id)
+    assert caught.value.code == "upload_already_received"
+    assert caught.value.details == {"project_status": "ready"}
 
+
+def test_complete_upload_before_bytes_is_upload_missing(client):
+    project = client.projects.create(file_name="clip.wav")
+    with pytest.raises(DiffioApiError) as caught:
+        client.projects.complete_upload(project.id)
+    assert (caught.value.status, caught.value.code) == (409, "upload_missing")
+
+
+def test_projects_list_iter_get_and_delete(client, fake):
+    ids = [client.projects.create(file_name=f"f{i}.mp3").id for i in range(5)]
+    page = client.projects.list(limit=2)
+    assert [p.id for p in page] == [ids[4], ids[3]]
+    assert page.next_cursor == ids[3] and page.has_more
+    assert fake.last().url.params["limit"] == "2"
+    second = client.projects.list(limit=2, cursor=page.next_cursor)
+    assert [p.id for p in second] == [ids[2], ids[1]]
+    assert [p.id for p in client.projects.iter(limit=2)] == list(reversed(ids))
+    assert len(fake.sent("GET", r"/v2/projects\?")) == 2 + 3
+    got = client.projects.get(ids[0])
+    assert got.file_name == "f0.mp3" and got.latest_generation is None
+    deleted = client.projects.delete(ids[0])
+    assert deleted.deleted is True and deleted.id == ids[0]
+    with pytest.raises(DiffioApiError) as caught:
+        client.projects.get(ids[0])
+    assert caught.value.code == "project_not_found"
+
+
+def test_project_ids_are_path_encoded(client, fake):
+    with pytest.raises(DiffioApiError):
+        client.projects.get("a/b")
+    assert fake.last().url.raw_path == b"/v2/projects/a%2Fb"
+
+
+# ---- generations ---------------------------------------------------------------------------------------
+
+
+def test_generations_create_wait_list_get(client, fake, tmp_path):
+    project = client.projects.create(file_name="clip.mp3")
+    client.projects.upload(project, b"ID3data")
+    generation = client.generations.create(project.id, model="diffio-flash", label="Take 1")
+    request = fake.last("POST", r"/generations$")
+    assert body(request) == {"model": "diffio-flash", "label": "Take 1"}
+    assert request.headers["Idempotency-Key"].startswith("diffio-python-")
+    assert isinstance(generation, Generation)
+    assert generation.model == "diffio-4.7-flash" and generation.requested_model == "diffio-flash"
+    seen = []
+    finished = client.generations.wait(project.id, generation.id, on_progress=lambda g: seen.append(g.status))
+    assert seen == ["processing", "complete"]
+    assert finished.status == "complete" and finished.files_available == ["audio", "transcript"]
+    assert seen and seen[0] == "processing"
+    assert [g.id for g in client.generations.list(project.id)] == [generation.id]
+    assert [g.id for g in client.generations.iter(project.id, limit=1)] == [generation.id]
+    assert client.generations.get(project, generation).id == generation.id
+
+
+def test_generations_create_retry_keeps_the_key(client, fake):
+    project = client.projects.create(file_name="clip.mp3")
+    fake.fail("POST", r"/generations$", exc=httpx.ReadTimeout("lost"), times=1)
+    generation = client.generations.create(project.id, model="diffio-pro", idempotency_key="restore-7")
+    sent = fake.sent("POST", r"/generations$")
+    assert [r.headers["Idempotency-Key"] for r in sent] == ["restore-7", "restore-7"]
+    assert generation.status == "queued"
+
+
+def test_generations_create_unknown_model(client):
+    project = client.projects.create(file_name="clip.mp3")
+    with pytest.raises(DiffioApiError) as caught:
+        client.generations.create(project.id, model="diffio-9-ultra")
+    assert caught.value.code == "unknown_model"
+    assert "diffio-flash" in caught.value.details["models"]
     with pytest.raises(ValueError):
-        client.webhooks.send_test_event(
-            eventType="generation.unknown",
-            mode="test",
-        )
+        client.generations.create(project.id, model="")
 
 
-@pytest.mark.parametrize("failure_kind", ["status", "transport"])
-@pytest.mark.parametrize("model", list(MODEL_ENDPOINTS))
-@pytest.mark.parametrize("options_scope", ["client", "request"])
-@pytest.mark.parametrize("idempotency_key", [None, "", "   ", 123])
-def test_create_generation_does_not_retry_without_usable_idempotency_key(
-    failure_kind, model, options_scope, idempotency_key
-):
+def test_wait_raises_generation_failed(client, fake):
+    fake.fail_generation_with = "no_speech_detected"
+    project = client.projects.create(file_name="clip.mp3")
+    client.projects.upload(project, b"x")
+    generation = client.generations.create(project.id, model="diffio-flash")
+    with pytest.raises(GenerationFailedError) as caught:
+        client.generations.wait(project.id, generation.id)
+    assert caught.value.code == "no_speech_detected"
+    assert caught.value.generation.status == "failed"
+    assert caught.value.retryable is False
+
+
+def test_wait_times_out(client, fake, monkeypatch):
+    fake.polls_to_complete = 10 ** 6
+    project = client.projects.create(file_name="clip.mp3")
+    client.projects.upload(project, b"x")
+    generation = client.generations.create(project.id, model="diffio-flash")
+    clock = iter(range(0, 10 ** 6, 5))
+    monkeypatch.setattr("diffio.resources.time.monotonic", lambda: next(clock))
+    with pytest.raises(DiffioTimeoutError) as caught:
+        client.generations.wait(project.id, generation.id, timeout=12)
+    assert caught.value.last.status == "processing"
+
+
+def test_media_and_download(client, fake, tmp_path):
+    project, generation = ready_generation(client, fake, tmp_path)
+    media = client.generations.media(project.id, generation.id, preview_seconds=8)
+    assert fake.last().url.params["preview_seconds"] == "8"
+    assert media.files["audio"].startswith(media.base_url)
+    out = tmp_path / "restored.mp3"
+    saved = client.generations.download(project.id, generation.id, path=out)
+    assert saved == str(out) and out.read_bytes() == b"ID3restored-audio"
+    umask = os.umask(0)
+    os.umask(umask)
+    assert out.stat().st_mode & 0o777 == 0o666 & ~umask
+    assert "Authorization" not in fake.last("GET", r"restored\.mp3").headers
+    assert client.generations.download(project.id, generation.id) == b"ID3restored-audio"
+    folder = tmp_path / "out"
+    folder.mkdir()
+    assert client.generations.download(project.id, generation.id, path=folder).endswith("restored.mp3")
+    with pytest.raises(DiffioError, match="video is not available"):
+        client.generations.download(project.id, generation.id, file="video", path=tmp_path / "v.mp4")
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".diffio-download-")] == []
+
+
+def test_download_media_host_errors_are_typed(client, fake, tmp_path):
+    project, generation = ready_generation(client, fake, tmp_path)
+    fake.fail("GET", r"restored\.mp3", status=403, code="preview_limited", times=1)
+    with pytest.raises(DiffioApiError) as caught:
+        client.generations.download(project.id, generation.id, path=tmp_path / "x.mp3")
+    assert (caught.value.status, caught.value.code) == (403, "preview_limited")
+    assert not (tmp_path / "x.mp3").exists()
+
+
+# ---- edits, mix, exports, transcripts, assistant ---------------------------------------------------------
+
+
+def test_edits_estimate_and_create(client, fake, tmp_path):
+    project, generation = ready_generation(client, fake, tmp_path, model="diffio-pro")
+    words = [{"id": "word-0", "text": ""}, {"id": "word-1", "text": "there", "start": 0.84, "end": 0.94}]
+    estimate = client.edits.estimate(project.id, generation.id, words=words)
+    assert body(fake.last()) == {"words": words}
+    assert estimate.max_billable_seconds == 30 and estimate.window_seconds == 30
+    edit = client.edits.create(project.id, generation.id, words=words, request_id="edit-1",
+                               tighten={"close_removed_gaps": True}, idempotency_key="edit-key")
+    request = fake.last()
+    assert body(request) == {"words": words, "tighten": {"close_removed_gaps": True}, "request_id": "edit-1"}
+    assert request.headers["Idempotency-Key"] == "edit-key"
+    assert edit.kind == "edit" and edit.source_generation_id == generation.id
+    assert edit.edit.request_id == "edit-1"
+
+
+def test_mix_get_save_and_conflict(client, fake, tmp_path):
+    project, generation = ready_generation(client, fake, tmp_path)
+    mix = client.mix.get(project.id, generation.id)
+    assert mix.background_gain == 0 and mix.revision == "rev:0"
+    saved = client.mix.save(project.id, generation.id, background_gain=0.3, revision=mix.revision)
+    assert fake.last().method == "PUT"
+    assert body(fake.last()) == {"background_gain": 0.3, "revision": "rev:0"}
+    assert saved.revision == "rev:1"
+    with pytest.raises(DiffioApiError) as caught:
+        client.mix.save(project.id, generation.id, background_gain=0.5, revision="rev:0")
+    assert caught.value.code == "revision_conflict"
+    assert caught.value.details == {"current_revision": "rev:1"}
+
+
+def test_exports_create_get_wait(client, fake, tmp_path):
+    project, generation = ready_generation(client, fake, tmp_path)
+    export = client.exports.create(project.id, generation.id, artifact="mix", format="mp3", file_name="interview mix")
+    assert body(fake.last()) == {"artifact": "mix", "format": "mp3", "file_name": "interview mix"}
+    assert export.status == "queued" and export.url is None
+    ready = client.exports.wait(project.id, generation.id, export.id, file_name="interview mix")
+    assert ready.status == "ready" and "download=interview" in ready.url
+    assert fake.last().url.params["file_name"] == "interview mix"
+    again = client.exports.get(project.id, generation.id, export.id)
+    assert again.status == "ready"
+
+
+def test_exports_wait_raises_on_failure(client, fake, tmp_path):
+    project, generation = ready_generation(client, fake, tmp_path)
+    export = client.exports.create(project.id, generation.id, artifact="speech", format="wav")
+    fake.exports[export.id].update(status="failed", error={"code": "export_failed", "message": "Render failed."})
+    with pytest.raises(ExportFailedError) as caught:
+        client.exports.wait(project.id, generation.id, export.id)
+    assert caught.value.code == "export_failed"
+    assert caught.value.export.id == export.id
+
+
+def test_transcripts_and_drafts(client, fake, tmp_path):
+    project, generation = ready_generation(client, fake, tmp_path)
+    transcript = client.transcripts.get(project.id, generation.id, preview_seconds=8)
+    assert fake.last().url.params["preview_seconds"] == "8"
+    assert transcript.text == "Hello there"
+    assert transcript.words[0].id == "word-0" and transcript.words[0]["language"] == "en"
+    draft = client.transcripts.get_draft(project.id, generation.id)
+    assert draft.revision == "0" and draft.data is None
+    saved = client.transcripts.save_draft(project.id, generation.id, data={"cursor": 1}, revision=draft.revision)
+    assert body(fake.last()) == {"data": {"cursor": 1}, "revision": "0"}
+    assert saved.revision == "1" and saved.data == {"cursor": 1}
+    with pytest.raises(DiffioApiError) as caught:
+        client.transcripts.delete_draft(project.id, generation.id, revision="0")
+    assert caught.value.code == "revision_conflict"
+    deleted = client.transcripts.delete_draft(project.id, generation.id, revision="1")
+    assert fake.last().url.params["revision"] == "1"
+    assert deleted.deleted is True and deleted.revision == "2"
+
+
+def test_assistant_turns(client, fake, tmp_path):
+    project, generation = ready_generation(client, fake, tmp_path, model="diffio-pro")
+    turn = client.assistant.create_turn(project.id, generation.id,
+                                        messages=[{"role": "user", "content": "Remove filler words"}],
+                                        selection={"word_ids": ["word-0"]}, playhead_seconds=1.5)
+    assert body(fake.last()) == {"messages": [{"role": "user", "content": "Remove filler words"}],
+                                 "selection": {"word_ids": ["word-0"]}, "playhead_seconds": 1.5}
+    assert turn.status == "processing"
+    assert client.assistant.get_turn(project.id, generation.id, turn.id).status == "processing"
+    done = client.assistant.wait_turn(project.id, generation.id, turn.id)
+    assert done.status == "complete" and done.reply == "Removed one filler word."
+
+
+# ---- shares, usage, webhooks ----------------------------------------------------------------------------
+
+
+def test_shares_publish_get_public_and_revoke(client, fake, tmp_path):
+    project, generation = ready_generation(client, fake, tmp_path)
+    share = client.shares.publish(project.id, preview_seconds=8)
+    assert body(fake.last()) == {"preview_seconds": 8}
+    assert share.generation_id == generation.id and share.files["audio"].startswith(share.base_url)
+    assert client.shares.get(project.id).id == share.id
+    public = client.shares.get_public(share.id)
+    assert "Authorization" not in fake.last().headers
+    assert public.id == share.id
+    revoked = client.shares.revoke(project.id)
+    assert revoked.deleted is True and revoked.id == share.id
+    with pytest.raises(DiffioApiError) as caught:
+        client.shares.get_public(share.id)
+    assert caught.value.code == "share_not_found"
+
+
+def test_usage_formats_dates(client, fake):
+    usage = client.usage.get(start=datetime.date(2026, 11, 1),
+                             end=datetime.datetime(2026, 11, 12, 18, 0, tzinfo=datetime.timezone(datetime.timedelta(hours=-7))))
+    params = fake.last().url.params
+    assert params["start"] == "2026-11-01"
+    assert params["end"] == "2026-11-13T01:00:00Z"
+    assert usage.billable_seconds == 60 and usage.by_model[0].model == "diffio-4.7-flash"
+    client.usage.get()
+    assert "start" not in fake.last().url.params
+
+
+def test_webhooks_portal_never_sends_the_end_user(fake):
+    client = DiffioClient(KEY, base_url=API, http_client=fake.http_client(), end_user="customer-1")
+    portal = client.webhooks.portal()
+    assert "Diffio-End-User" not in fake.last().headers
+    assert portal.url.startswith("https://portal.test")
+
+
+WEBHOOK_SECRET = "whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"
+EVENT = {"type": "generation.completed", "id": "evt_0123456789abcdef0123456789abcdef", "created_at": "2026-11-13T00:33:41Z",
+         "data": {"object": "generation", "id": "gen_1", "project_id": "proj_1", "end_user": "customer-42",
+                  "status": "complete", "kind": "restore"}}
+
+
+def _svix_signed(payload, msg_id="msg_1", when=None):
+    when = when or datetime.datetime.now(datetime.timezone.utc)
+    signature = Webhook(WEBHOOK_SECRET).sign(msg_id, when, payload)
+    return {"svix-id": msg_id, "svix-timestamp": str(int(when.timestamp())), "svix-signature": signature}
+
+
+def test_verify_signature_accepts_svix_signed_events(client):
+    payload = json.dumps(EVENT)
+    headers = _svix_signed(payload)
+    event = client.webhooks.verify_signature(payload.encode(), headers, WEBHOOK_SECRET)
+    assert event.type == "generation.completed" and event.data.end_user == "customer-42"
+    upper = {key.upper(): value for key, value in headers.items()}
+    assert client.webhooks.verify_signature(payload, upper, WEBHOOK_SECRET).id == EVENT["id"]
+    rotated = dict(headers, **{"svix-signature": "v1,bm90LXRoaXM= " + headers["svix-signature"]})
+    assert diffio.verify_webhook_signature(payload, rotated, WEBHOOK_SECRET).data.id == "gen_1"
+
+
+@pytest.mark.parametrize("mutate,message", [
+    (lambda p, h: (p.replace("complete", "failed"), h), "No matching"),
+    (lambda p, h: (p, {k: v for k, v in h.items() if k != "svix-signature"}), "Missing webhook header svix-signature"),
+    (lambda p, h: (p, dict(h, **{"svix-timestamp": str(int(time.time()) - 3600)})), "too old"),
+    (lambda p, h: (p, dict(h, **{"svix-timestamp": "soon"})), "Invalid webhook timestamp"),
+])
+def test_verify_signature_refuses_bad_events(client, mutate, message):
+    payload = json.dumps(EVENT)
+    tampered_payload, tampered_headers = mutate(payload, _svix_signed(payload))
+    with pytest.raises(WebhookVerificationError, match=message):
+        client.webhooks.verify_signature(tampered_payload, tampered_headers, WEBHOOK_SECRET)
+
+
+def test_verify_signature_refuses_a_wrong_secret(client):
+    payload = json.dumps(EVENT)
+    with pytest.raises(WebhookVerificationError):
+        client.webhooks.verify_signature(payload, _svix_signed(payload), "whsec_" + "A" * 32)
+    with pytest.raises(WebhookVerificationError, match="secret"):
+        client.webhooks.verify_signature(payload, _svix_signed(payload), "")
+
+
+# ---- one call restore -----------------------------------------------------------------------------------
+
+
+def test_restore_audio_runs_the_whole_flow(client, fake, tmp_path):
+    audio = tmp_path / "interview.mp3"
+    audio.write_bytes(b"ID3" + b"\0" * 64)
+    progress = []
+    result = client.restore_audio(audio, model="diffio-pro", output_path=tmp_path / "restored.mp3",
+                                  on_progress=lambda g: progress.append(g.status), end_user="customer-9")
+    create = fake.sent("POST", r"/v2/projects$")[0]
+    assert body(create) == {"file_name": "interview.mp3", "content_type": "audio/mpeg", "size_bytes": 67,
+                            "generation": {"model": "diffio-pro"}}
+    assert create.headers["Diffio-End-User"] == "customer-9"
+    assert not fake.sent("POST", r"/generations$")
+    assert fake.objects[result.project.id] == audio.read_bytes()
+    assert result.generation.status == "complete" and result.generation.model == "diffio-4.7-pro"
+    assert result.output_path == str(tmp_path / "restored.mp3")
+    assert (tmp_path / "restored.mp3").read_bytes() == b"ID3restored-audio"
+    assert progress[-1] == "complete"
+    assert all(r.headers.get("Diffio-End-User") == "customer-9" for r in fake.requests if str(r.url).startswith(API))
+
+
+def test_restore_audio_returns_bytes_without_output_path(client, fake):
+    result = client.restore_audio(b"RIFFdata", file_name="take.wav")
+    assert result.content == b"ID3restored-audio" and result.output_path is None
+    assert body(fake.sent("POST", r"/v2/projects$")[0])["generation"] == {"model": "diffio-flash"}
+    with pytest.raises(ValueError, match="file_name"):
+        client.restore_audio(b"RIFFdata")
+
+
+def test_restore_audio_raises_when_the_generation_fails(client, fake, tmp_path):
+    fake.fail_generation_with = "restoration_failed"
+    audio = tmp_path / "a.wav"
+    audio.write_bytes(b"RIFF")
+    with pytest.raises(GenerationFailedError) as caught:
+        client.restore_audio(audio, output_path=tmp_path / "out.mp3")
+    assert caught.value.code == "restoration_failed"
+    assert not (tmp_path / "out.mp3").exists()
+
+
+# ---- response objects -----------------------------------------------------------------------------------
+
+
+def test_response_objects_keep_unknown_fields_and_wire_names():
+    project = Project({"id": "p", "status": "ready", "latest_generation": {"id": "g", "status": "failed",
+                       "error": {"code": "timed_out", "message": "Too slow.", "retryable": True, "explanation": None}},
+                       "brand_new_field": {"x": 1}})
+    assert project["brand_new_field"] == {"x": 1}
+    assert project.brand_new_field == {"x": 1}
+    assert project.latest_generation.error.retryable is True
+    assert project.upload is None and project.get("upload", "none") == "none"
+    assert project.to_dict()["latest_generation"]["error"]["code"] == "timed_out"
+    assert Generation({"id": "g", "is_finished": "wire"}).is_finished is False
+    with pytest.raises(KeyError):
+        project["nope"]
+
+
+def test_download_restarts_after_a_dropped_body(client, fake, tmp_path):
+    project, generation = ready_generation(client, fake, tmp_path)
+    original = fake.handle
     calls = []
 
-    def handler(request):
-        calls.append(request)
-        if failure_kind == "transport":
-            raise httpx.ReadTimeout("Response lost after acceptance", request=request)
-        return httpx.Response(503, json={"error": "unavailable"})
+    class Broken(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"ID3par"
+            raise httpx.ReadError("dropped")
 
-    retry_options = {"maxRetries": 2, "retryBackoff": 0}
-    with httpx.Client(base_url="https://api.test", transport=httpx.MockTransport(handler)) as http_client:
-        client = DiffioClient(
-            apiKey="diffio_live_test",
-            baseUrl="https://api.test",
-            httpClient=http_client,
-            requestOptions=retry_options if options_scope == "client" else None,
-        )
-        expected_error = httpx.ReadTimeout if failure_kind == "transport" else DiffioApiError
-        with pytest.raises(expected_error):
-            client.generations.create(
-                apiProjectId="proj",
-                model=model,
-                idempotencyKey=idempotency_key,
-                requestOptions=retry_options if options_scope == "request" else None,
-            )
+    def handle(request):
+        if request.url.path.endswith("restored.mp3"):
+            calls.append(1)
+            if len(calls) == 1:
+                return httpx.Response(200, stream=Broken())
+        return original(request)
 
-    assert len(calls) == 1
-
-
-@pytest.mark.parametrize("failure_kind", ["status", "transport"])
-@pytest.mark.parametrize("model", list(MODEL_ENDPOINTS))
-@pytest.mark.parametrize("options_scope", ["client", "request"])
-def test_create_generation_retries_same_idempotent_request(failure_kind, model, options_scope):
-    calls = []
-
-    def handler(request):
-        calls.append(request.content)
-        if len(calls) == 1:
-            if failure_kind == "transport":
-                raise httpx.ReadTimeout("Response lost after acceptance", request=request)
-            return httpx.Response(503, json={"error": "unavailable"})
-        return httpx.Response(
-            200,
-            json={
-                "generationId": "gen_original",
-                "apiProjectId": "proj",
-                "modelKey": model,
-                "status": "queued",
-                "idempotentReplay": True,
-            },
-        )
-
-    retry_options = {"maxRetries": 2, "retryBackoff": 0}
-    with httpx.Client(base_url="https://api.test", transport=httpx.MockTransport(handler)) as http_client:
-        client = DiffioClient(
-            apiKey="diffio_live_test",
-            baseUrl="https://api.test",
-            httpClient=http_client,
-            requestOptions=retry_options if options_scope == "client" else None,
-        )
-        generation = client.generations.create(
-            apiProjectId="proj",
-            model=model,
-            idempotencyKey="customer-operation-1",
-            sampling={"steps": 12},
-            params={"seed": 42},
-            requestOptions=retry_options if options_scope == "request" else None,
-        )
-
-    assert len(calls) == 2
-    assert calls[0] == calls[1]
-    assert json.loads(calls[1])["idempotencyKey"] == "customer-operation-1"
-    assert generation.generationId == "gen_original"
-    assert generation.idempotentReplay is True
-
-
-def test_wait_for_generation_waits_for_overall_completion_after_stage_completion():
-    responses = [
-        ("pending", "pending", 0),
-        ("processing", "running", 20),
-        ("processing", "complete", 100),
-        ("complete", "complete", 100),
-    ]
-    progress_calls = []
-
-    def handler(request):
-        status, video_status, video_progress = responses.pop(0)
-        return httpx.Response(
-            200,
-            json={
-                "generationId": "gen_video",
-                "apiProjectId": "proj",
-                "status": status,
-                "hasVideo": True,
-                "preProcessing": {"status": "complete", "progress": 100},
-                "inference": {"status": "complete", "progress": 100},
-                "restoredVideo": {"status": video_status, "progress": video_progress},
-            },
-        )
-
-    with httpx.Client(base_url="https://api.test", transport=httpx.MockTransport(handler)) as http_client:
-        client = DiffioClient(apiKey="diffio_live_test", httpClient=http_client)
-        progress = client.generations.wait_for_complete(
-            generationId="gen_video",
-            apiProjectId="proj",
-            pollInterval=0,
-            timeout=5,
-            onProgress=lambda progress: progress_calls.append(progress.status),
-        )
-
-    assert progress.status == "complete"
-    assert progress_calls == ["pending", "processing", "processing", "complete"]
-    assert not responses
+    client._http = httpx.Client(transport=httpx.MockTransport(handle))
+    out = tmp_path / "again.mp3"
+    client.generations.download(project.id, generation.id, path=out)
+    assert out.read_bytes() == b"ID3restored-audio" and len(calls) == 2
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".diffio-download-")] == []

@@ -12,14 +12,14 @@
 
 ## Coding Style and Naming Conventions
 * Use 4 space indentation and follow standard Python style conventions.
-* Keep public API names in `camelCase` to match the service contract, for example `create_project` arguments like `fileName`.
+* Request and response field names are `snake_case`, matching the v2 service contract exactly as on the wire, for example `client.projects.create(file_name=..., size_bytes=...)` and `project.latest_generation.status`.
 * Do not add Python typing, type hints, or `typing` imports in this SDK.
 * Avoid `from __future__ import annotations` in SDK files.
 
 ## Testing Guidelines
 * Tests are written with pytest and live under `tests`.
 * Name tests with the `test_*.py` pattern, for example `tests/test_client.py`.
-* Prefer adding or updating fixtures in `tests/fixtures` when new API flows need stable inputs.
+* Prefer extending the fake v2 API in `tests/fake_api.py` when new API flows need test coverage.
 
 ## Commit and Pull Request Guidelines
 * There is no enforced commit message format, use short imperative summaries that describe the change.
@@ -34,5 +34,5 @@
 
 ## Configuration and Environment
 * Set `DIFFIO_API_KEY` for authenticated requests.
-* Override `DIFFIO_API_BASE_URL` when pointing at the Functions emulator or a non default endpoint.
-* Keep emulator base URLs consistent with the examples in `README.md`.
+* Override `DIFFIO_API_BASE_URL` with another API host (for example `https://diffio-api-dev.web.app` for dev); the SDK adds `/v2`.
+* Unit tests use the in-memory fake in `tests/fake_api.py`; never point tests at production.
