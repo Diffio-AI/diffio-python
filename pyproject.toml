@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "diffio"
-version = "0.4.0"
-description = "Python SDK for the Diffio API."
+version = "1.0.0"
+description = "Python SDK for the Diffio API v2."
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
@@ -14,7 +14,6 @@ authors = [
 ]
 dependencies = [
     "httpx>=0.24.0",
-    "svix>=1.84.1,<2.0.0"
 ]
 classifiers = [
     "License :: OSI Approved :: MIT License",
@@ -32,6 +31,7 @@ classifiers = [
 dev = [
     "build>=1.0",
     "pytest>=7.4",
+    "svix>=1.84.1,<2.0.0",
     "twine>=5.0",
 ]
 

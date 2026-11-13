@@ -1,7 +1,10 @@
 # Diffio Python SDK
 
-The Diffio Python SDK helps you call the Diffio API from Python. This version covers project creation, upload, generation, progress checks, and download URLs.
-Requires Python 3.8 or later.
+Python client for the Diffio API v2 (`https://api.diffio.ai/v2`): upload a recording, restore its speech, and
+download the result. Requires Python 3.8 or later. Its only dependency is `httpx`.
+
+Version 1.0 talks to `/v2` only. Code written for the 0.x SDK (the `/v1` API) keeps working on `pip install "diffio<1"`;
+see [Upgrading from 0.x](#upgrading-from-0x).
 
 ## Install
 
@@ -9,373 +12,268 @@ Requires Python 3.8 or later.
 pip install diffio
 ```
 
-For local development:
+## Restore a recording in one call
 
-```bash
-cd diffio-python
-pip install -e .
+```py
+from diffio import DiffioClient
+
+client = DiffioClient()  # reads DIFFIO_API_KEY
+
+result = client.restore_audio(
+    "interview.mp3",
+    model="diffio-flash",
+    output_path="interview-restored.mp3",
+    on_progress=lambda generation: print(generation.status, generation.stage),
+)
+print(result.project.id, result.generation.id, result.output_path)
 ```
+
+`restore_audio` creates the project with the restore already requested, uploads the file, waits for the
+generation, and downloads the restored MP3 (`file="audio"`; any name from the generation's media files works).
+Without `output_path` the bytes are on `result.content`. A failed restore raises `GenerationFailedError`.
+There is no length limit on API uploads; files can be up to 2 GB.
 
 ## Configuration
 
-Set the API key with `DIFFIO_API_KEY`. If you need to set the base URL explicitly, use the production endpoint with `DIFFIO_API_BASE_URL`.
+| Setting | Argument | Environment | Default |
+|---|---|---|---|
+| API key | `DiffioClient(api_key=...)` | `DIFFIO_API_KEY` | none |
+| API host | `base_url=` | `DIFFIO_API_BASE_URL` | `https://api.diffio.ai` (`/v2` is added) |
+| End user | `end_user=` | | none |
+| Timeout (seconds) | `timeout=` | | `60` |
+| Retries | `max_retries=`, `retry_backoff=` | | `2`, `0.5` |
 
-```bash
-export DIFFIO_API_KEY="diffio_live_..."
-export DIFFIO_API_BASE_URL="https://api.diffio.ai/v1"
-```
+Create keys on the developer dashboard at https://diffio.ai/developers/api-keys. The key is sent as
+`Authorization: Bearer <key>`.
 
-## Request options
+Every method also takes `request_options={"headers": ..., "timeout": ..., "max_retries": ..., "api_key": ...}`
+to change one call.
 
-Use request options to override headers, timeouts, retries, or the API key per request.
-You can also pass `timeoutInSeconds` as an alias for `timeout`.
+### Retries and idempotency
 
-Generation creation is retried only when you supply a non-empty `idempotencyKey`,
-even when `maxRetries` is configured globally or per request. Without a key, a
-timeout or lost response can hide an accepted generation, so the SDK returns the
-error after the first attempt. With a key, retries send the same key and payload.
-Reuse that key when manually retrying the same operation; use a new key for a new
-generation. The audio isolation and restore helpers do not supply a key and do
-not automatically retry their generation-creation step.
+Calls that are safe to repeat (GET, PUT, DELETE, completing an upload, creating an export, edit estimates, and
+every upload part) are retried on HTTP 408, 429, 500, 502, 503, 504 and network errors, with exponential
+backoff that honours `Retry-After`.
+
+`projects.create`, `generations.create` and `edits.create` send an `Idempotency-Key` header. Pass your own
+`idempotency_key=` to make a repeat of the same request (from any process) return the first result; without one
+the SDK sends a fresh key per call, so its own retries never create a second project or start a second restore.
+Reusing a key with a different request is refused with `idempotency_key_conflict`.
+
+### End users
+
+If one API key serves many people, set `end_user` (on the client or per call). It is sent as the
+`Diffio-End-User` header: projects are created for that end user, lists show only their projects, any other
+project answers `project_not_found`, and `usage.get` reports only their usage.
 
 ```py
-from diffio import DiffioClient, RequestOptions
-
-client = DiffioClient(apiKey="diffio_live_...")
-projects = client.list_projects(
-    requestOptions=RequestOptions(
-        headers={"X-Debug": "1"},
-        timeout=30.0,
-        maxRetries=2,
-        retryBackoff=0.5,
-    )
-)
+client = DiffioClient(end_user="customer-42")
+client.projects.list(end_user="customer-7")  # one call for someone else
 ```
 
-## Models
+## Step by step
 
-Diffio 4.7 Flash (`diffio-4.7-flash`) and Diffio 4.7 Pro (`diffio-4.7-pro`) are the only
-models. `diffio-4.7-flash` is the default and works on every plan; `diffio-4.7-pro` needs a
-paid plan. Older model names from earlier SDK releases still work and run Diffio 4.7, but they
-are deprecated and emit a `DeprecationWarning`. Retired model ids raise `ValueError` before a
-request is sent (the API answers retired model endpoints with HTTP 410 and code `model_retired`).
-Existing generations created with older models keep their `modelKey` and can still be listed,
-polled, and downloaded.
+```py
+import os
 
-## Create a project and generation
+from diffio import DiffioClient
 
-`create_project` creates the project, uploads the file, and confirms the upload:
+client = DiffioClient(end_user="customer-42")  # every call acts for this end user
 
-1. `POST /v1/create_project` returns the project id and an upload session (`project.upload`):
-   `edgeBaseUrl`, `uploadToken`, `objectKey`, `partSizeBytes` (32 MiB), `maxBytes`, `expiresAt`.
-2. The file goes to the Diffio upload API at `edgeBaseUrl` in `partSizeBytes` parts
-   (`/v1/uploads/start`, `/v1/uploads/parts/{n}`, `/v1/uploads/complete`), authorized with
-   `Authorization: Bearer {uploadToken}`. Your API key is never sent to the upload API.
-   With `maxRetries` set, a failed part is retried on its own instead of resending the file.
-   If a part still fails, the SDK aborts the partial upload and raises `DiffioApiError`.
-3. `POST /v1/complete_project_upload` confirms the upload so preprocessing starts. Its answer is
-   on `project.uploadCompletion` (`status`, `sizeBytes`). It is idempotent; you can call
-   `client.complete_project_upload(apiProjectId=...)` (or `client.projects.complete_upload`) again.
+project = client.projects.create(
+    file_name="interview.mp3",
+    size_bytes=os.path.getsize("interview.mp3"),
+    content_type="audio/mpeg",
+    metadata={"order_id": "1042"},
+)
+project = client.projects.upload(project, "interview.mp3")  # media host upload, then upload/complete
+print(project.id, project.status)  # preparing or ready
 
-Files larger than the session's `maxBytes` (2 GiB) raise `ValueError` before any bytes are sent.
+generation = client.generations.create(project.id, model="diffio-pro", idempotency_key="order-1042-restore")
+generation = client.generations.wait(
+    project.id,
+    generation.id,
+    on_progress=lambda g: print(g.status, g.stage),
+)
+media = client.generations.media(project.id, generation.id)
+print(sorted(media.files), media.expires_at)
+
+path = client.generations.download(project.id, generation.id, file="audio", path="interview-pro.mp3")
+print(path, generation.model, generation.quality_score)
+```
+
+- `projects.create` answers the project plus `project.upload`: the media host's upload requests and the token
+  they carry. Pass `generation={"model": "diffio-flash"}` (or just `generation="diffio-flash"`) to request the
+  restore with the project; it starts by itself once the upload is ready.
+- `projects.upload(project, file)` follows `project.upload.requests` (start, one PUT per 32 MiB part, complete).
+  `file` is a path, bytes or a binary file object. Each part is retried on its own; a failed upload is aborted.
+  Your API key is never sent to the media host. It then calls `projects.complete_upload` so the file is checked
+  now (pass `complete=False` to skip; the project then becomes ready by itself about 30 seconds later). Pass a
+  project id instead of a project to fetch fresh instructions with `projects.reopen_upload`.
+- `generations.create` works before the upload is ready too; the generation waits for it.
+- `generations.wait` polls every 2 seconds until `status` is `complete`. It raises `GenerationFailedError`
+  (with `.generation`, `.code`, `.retryable`) when the generation fails and `DiffioTimeoutError` after `timeout`
+  seconds (default 3600; `None` waits without limit).
+- A generation's `status` is `queued`, `processing`, `complete` or `failed`; `stage`, `stage_progress` and
+  `queue` describe a running one. `files_available` names its files.
+- `generations.media` hands out URLs for those files, valid for 6 hours: `audio` (restored MP3), `audio_mixed`,
+  `original`, `transcript`, `hls_master` and more. `generations.download(..., file=..., path=...)` streams one
+  of them to a file (or returns bytes without `path`).
+
+## Lists and pagination
 
 ```py
 from diffio import DiffioClient
 
-client = DiffioClient(apiKey="diffio_live_...")
-file_path = "sample.wav"
-project = client.create_project(
-    filePath=file_path,
-)
+client = DiffioClient()
 
-generation = client.create_generation(
-    apiProjectId=project.apiProjectId,
-    model="diffio-4.7-flash",
-    idempotencyKey="restore-job-2026-001",
-    requestOptions={"maxRetries": 2},
-)
+page = client.projects.list(limit=1)
+for project in page.data:
+    print(project.id, project.status, project.file_name)
+if page.next_cursor:
+    page = client.projects.list(limit=1, cursor=page.next_cursor)
+    print("next page:", [project.id for project in page.data])
 
-print(generation.generationId)
-print(generation.idempotentReplay)
+for project in client.projects.iter(limit=50):  # fetches every page as needed
+    latest = project.latest_generation
+    print(project.id, project.file_name, latest.status if latest else "no generation")
 ```
 
-Use one stable `idempotencyKey` for every retry of the same logical generation request.
-The response's optional `idempotentReplay` value is `True` when the API returns the
-result of an earlier request with that key. Use a new key for a different generation.
+Lists are newest first. `limit` is 1 to 100 (default 20). `generations.list(project_id)` and
+`generations.iter(project_id)` work the same way.
 
-## Audio isolation helper
+## Errors
 
-```py
-from diffio import DiffioClient
+Every refusal of the API raises `DiffioApiError` with:
 
-client = DiffioClient(apiKey="diffio_live_...")
-result = client.audio_isolation.isolate(
-    filePath="sample.wav",
-    model="diffio-4.7-flash",
-)
-
-print(result.generation.generationId)
-```
-
-## Restore audio in one call
-
-This helper runs the full flow and returns the downloaded bytes plus a metadata dict.
-
-```py
-from diffio import DiffioClient
-
-client = DiffioClient(apiKey="diffio_live_...")
-audio_bytes, info = client.restore_audio(
-    filePath="sample.wav",
-    model="diffio-4.7-flash",
-    onProgress=lambda progress: print(progress.status),
-)
-
-if info["error"]:
-    print(info["error"])
-else:
-    with open("restored.mp3", "wb") as handle:
-        handle.write(audio_bytes)
-
-print(info["apiProjectId"], info["generationId"])
-```
-
-## Generation progress
-
-`wait_for_generation` and `generations.wait_for_complete` wait for the overall
-`status` to become `complete`. Individual stages can reach 100% while video
-restoration or final settlement is still pending; stage progress alone does not
-indicate overall completion.
-
-`complete` means restored media is ready. Diffio 4.7 transcribes the recording
-before restoration starts, so a completed generation has its transcript; while a
-generation runs, transcription can be `pending`, `available`, or `unavailable`.
-Read `progress.transcription.status` independently; `progress.transcription` is `None`
-for older responses that do not report availability. `progress.stage`,
-`progress.stageProgress`, and `progress.queue` (fleet queue position and message)
-are set while the API reports them and `None` otherwise. A completed generation
-remains successful if transcription is unavailable. Completion webhooks expose
-the same optional `event.transcription` object; a later transcript does not emit
-another `generation.completed` event.
-
-`progress.warnings` lists things to know about the recording; the generation still runs. It is
-empty until the transcript is ready. Each item is a `GenerationWarning` with `code`, `languages`,
-and a readable `message`. `code == "unsupported_language"` means the transcript has speech in
-`languages` (ISO 639-1 codes such as `ja`, most words first) that Diffio does not support yet,
-so the result probably won't be usable. Generation webhooks carry the same warnings as
-`event.warnings` (an empty list when the payload has none), and a `generation.failed` webhook
-carries the same `retryable` as `event.retryable` (`None` when the payload does not include it).
-
-When a generation fails, `progress.retryable` is `True` if a new generation for the same project
-can fix it (for example, transcription that did not succeed after its automatic retries) and
-`False` otherwise (for example, an upload with no speech). It is `None` when there is no error.
-To retry, create a new generation for the project with a new `idempotencyKey` (or none); reusing
-the key returns the failed generation. `restore_audio` copies both into `info["warnings"]` and
-`info["retryable"]`.
-
-```py
-from diffio import DiffioClient
-
-client = DiffioClient(apiKey="diffio_live_...")
-progress = client.generations.get_progress(
-    generationId="gen_123",
-    apiProjectId="proj_123",
-)
-
-print(progress.status)
-if progress.transcription is not None:
-    print(progress.transcription.status)
-for warning in progress.warnings:
-    print(warning.code, warning.languages, warning.message)
-if progress.status == "failed" and progress.retryable:
-    retry = client.generations.create(apiProjectId="proj_123")
-```
-
-## Generation download
-
-```py
-from diffio import DiffioClient
-
-client = DiffioClient(apiKey="diffio_live_...")
-download = client.generations.download(
-    generationId="gen_123",
-    apiProjectId="proj_123",
-    downloadType="mp3",
-    downloadFilePath="restored.mp3",
-)
-
-print(download.downloadUrl)
-```
-
-If you only need the URL, use `client.generations.get_download`. Download URLs point at the
-Diffio media host, need no extra headers, and are valid for 6 hours. The response has
-`downloadType`, `downloadUrl`, `fileName`, `storagePath`, and `mimeType`.
-
-Set `downloadType="transcript"` to download the transcript JSON artifact when the generation has one.
-Pending transcripts return `DiffioApiError` with `statusCode == 409` and
-`responseBody["code"] == "TRANSCRIPT_PENDING"`. Unavailable transcripts return
-`statusCode == 404` and `responseBody["code"] == "TRANSCRIPT_UNAVAILABLE"`. These
-responses include `responseBody["transcription"]["status"]`. Check the error code
-to distinguish them from other 409 or 404 errors.
+| Attribute | Meaning |
+|---|---|
+| `status` | HTTP status (`None` when no answer arrived) |
+| `code` | stable snake_case code, for example `project_not_found`, `unknown_model`, `insufficient_credit`, `upload_missing`; `connection_error` when Diffio could not be reached |
+| `message` | a sentence to show or log |
+| `request_id` | quote it to Diffio support |
+| `details` | extra fields, for example `{"field": "model", "models": [...]}` |
 
 ```py
 from diffio import DiffioApiError
 
 try:
-    transcript = client.generations.download(
-        generationId="gen_123",
-        apiProjectId="proj_123",
-        downloadType="transcript",
-        downloadFilePath="word_timestamps.json",
-    )
-except DiffioApiError as exc:
-    body = exc.responseBody if isinstance(exc.responseBody, dict) else {}
-    if exc.statusCode == 409 and body.get("code") == "TRANSCRIPT_PENDING":
-        print("Transcript is pending; check progress and retry later.")
-    elif exc.statusCode == 404 and body.get("code") == "TRANSCRIPT_UNAVAILABLE":
-        print("Transcript is unavailable; restored media remains available.")
-    else:
-        raise
+    client.generations.create(project.id, model="diffio-9")
+except DiffioApiError as error:
+    print(error.status, error.code, error.message, error.request_id, error.details)
 ```
 
-`restore_audio(downloadType="transcript")` also makes one download request after
-media completion. It does not wait for a pending transcript. With its default
-`raiseOnError=False`, it returns `(None, info)` and preserves the API error in
-`info["statusCode"]` and `info["responseBody"]`; `info["status"]` can still be
-`complete` because media restoration succeeded. With `raiseOnError=True`, it raises
-the same `DiffioApiError` and attaches the metadata as `exc.restoreInfo`. Callers
-can poll progress and retry the transcript download explicitly. Audio and video
-downloads proceed independently of transcription availability.
+All SDK errors derive from `DiffioError`. Others: `GenerationFailedError`, `ExportFailedError`,
+`AssistantTurnFailedError` (from the wait helpers), `DiffioTimeoutError`, `WebhookVerificationError`.
 
-## Account, keys, usage, and webhook configuration
+## Response objects
 
-Agent keys can manage account settings, scoped keys, usage, and webhook endpoints.
+Responses are objects with the API's snake_case field names as attributes: `project.latest_generation.status`,
+`generation.error.code`, `media.files["audio"]`. `obj["field"]` and `obj.get("field")` also work, fields added by
+the API later are kept, and `obj.to_dict()` returns the answer as received.
+
+## More of the API
 
 ```py
-settings = client.account.get_settings()
-key = client.api_keys.create(
-    label="Backend worker",
-    scopes=["projects:read", "projects:write", "generations:read", "generations:write", "artifacts:read"],
-)
-usage = client.usage.summary(apiKeyId=key.keyId)
-webhook = client.webhooks.configure(
-    mode="live",
-    url="https://example.com/webhooks/diffio",
-    eventTypes=["generation.completed", "generation.failed"],
-    apiKeyId=key.keyId,
-)
+models = client.models.list()                                   # no key needed
+client.projects.get(project_id)
+client.projects.delete(project_id)                              # refused while a generation runs
+client.generations.list(project_id)
+
+transcript = client.transcripts.get(project_id, generation_id)  # text and word timings
+draft = client.transcripts.get_draft(project_id, generation_id)
+saved = client.transcripts.save_draft(project_id, generation_id, data={"cursor": 12}, revision=draft.revision)
+client.transcripts.delete_draft(project_id, generation_id, revision=saved.revision)
+
+# Transcript edits and the edit assistant need a finished Diffio Pro result (generation.transcript_editable).
+estimate = client.edits.estimate(project_id, generation_id, words=words)
+edit = client.edits.create(project_id, generation_id, words=words)          # a new generation, kind "edit"
+turn = client.assistant.create_turn(project_id, generation_id, messages=[{"role": "user", "content": "Remove the ums"}])
+turn = client.assistant.wait_turn(project_id, generation_id, turn.id)
+
+mix = client.mix.get(project_id, generation_id)                 # balance of speech and background
+client.mix.save(project_id, generation_id, background_gain=0.3, revision=mix.revision)
+export = client.exports.create(project_id, generation_id, artifact="mix", format="mp3")
+export = client.exports.wait(project_id, generation_id, export.id)
+print(export.url)
+
+share = client.shares.publish(project_id)                      # a link anyone can play
+client.shares.get_public(share.id)                              # no key needed
+client.shares.revoke(project_id)
+
+usage = client.usage.get(start="2026-11-01")                    # generations, billable seconds, list price
 ```
 
-## List projects
+## Webhooks
+
+`client.webhooks.portal()` returns a short-lived link to the webhook portal, where you add endpoint URLs, pick
+event types and copy each endpoint's signing secret (`whsec_...`). It needs a key with the `webhooks:write`
+scope. Events are signed by Svix (`svix-id`, `svix-timestamp`, `svix-signature`); check them with the raw
+request body:
 
 ```py
-from diffio import DiffioClient
-
-client = DiffioClient(apiKey="diffio_live_...")
-projects = client.projects.list()
-
-for project in projects.projects:
-    print(project.apiProjectId, project.status)
-```
-
-## List project generations
-
-```py
-from diffio import DiffioClient
-
-client = DiffioClient(apiKey="diffio_live_...")
-generations = client.projects.list_generations(apiProjectId="proj_123")
-
-for generation in generations.generations:
-    print(generation.generationId, generation.status)
-```
-
-## Send a test webhook event
-
-```py
-from diffio import DiffioClient
-
-client = DiffioClient(apiKey="diffio_live_...")
-event = client.webhooks.send_test_event(
-    eventType="generation.completed",
-    mode="live",
-    samplePayload={"apiProjectId": "proj_123"},
-)
-
-print(event.svixMessageId)
-```
-
-## Verify webhook signatures
-
-Use the raw request body (bytes) plus the `svix-*` headers and your webhook signing secret.
-
-```py
-from fastapi import FastAPI, Request, HTTPException
-from diffio import DiffioClient
 import os
 
-app = FastAPI()
-client = DiffioClient(apiKey=os.environ["DIFFIO_API_KEY"])
+from diffio import DiffioClient, WebhookVerificationError
 
-@app.post("/webhooks/diffio")
-async def diffio_webhook(request: Request):
-    payload = await request.body()
-    headers = request.headers
+client = DiffioClient()
+secret = os.environ["DIFFIO_WEBHOOK_SECRET"]  # the endpoint's whsec_... signing secret from the webhook portal
+
+
+def handle_webhook(raw_body, headers):
+    """raw_body: the request body bytes as received; headers: the request headers (any mapping)."""
     try:
-        event = client.webhooks.verify_signature(
-            payload=payload,
-            headers=headers,
-            secret=os.environ["DIFFIO_WEBHOOK_SECRET"],
-        )
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid signature")
-    print("Webhook received", event.eventType)
-    return {"ok": True}
+        event = client.webhooks.verify_signature(raw_body, headers, secret)
+    except WebhookVerificationError:
+        return 400
+    if event.type == "generation.completed":
+        print("restored", event.data.project_id, event.data.id, event.data.end_user)
+    elif event.type == "generation.failed":
+        print("failed", event.data.id, event.data.error_code)
+    return 200
 ```
 
-## Upgrading to 0.4.0
+Verification needs no API key and no network. Events older than 5 minutes are refused
+(`tolerance_seconds=`). Event ids are the same on every retry, so de-duplicate on `event.id`. An event names the
+resource that changed; read it again (for example `generations.get`) for the rest.
 
-0.4.0 adds Diffio 4.7 Flash (`diffio-4.7-flash`) and Diffio 4.7 Pro (`diffio-4.7-pro`), and the
-default model is now `diffio-4.7-flash`. Older model names still work and run Diffio 4.7, but
-they are deprecated and emit a `DeprecationWarning`. Generation progress adds `warnings` and
-`retryable`, and generation webhook events add `warnings` and `retryable`. Code written for 0.3.x runs without
-changes.
+## Upgrading from 0.x
 
-## Upgrading to 0.3.0
+1.0 removes the `/v1` methods. Request and response fields are snake_case, as on the wire.
 
-0.3.0 added Diffio 4.6 Flash (`diffio-4.6-flash`) and Diffio 4.6 Pro (`diffio-4.6-pro`), and the
-default model became `diffio-4.6-flash`. Request and response shapes were unchanged, and code
-written for 0.2.x ran without changes.
+| 0.x | 1.0 |
+|---|---|
+| `DiffioClient(apiKey=, baseUrl=)` | `DiffioClient(api_key=, base_url=)` |
+| `create_project(filePath=)` | `projects.create(file_name=, size_bytes=, ...)` then `projects.upload(project, path)` |
+| `complete_project_upload(apiProjectId=)` | `projects.complete_upload(project_id)` |
+| `create_generation(apiProjectId=, model="diffio-4.7-flash")` | `generations.create(project_id, model="diffio-flash")` |
+| `get_generation_progress`, `wait_for_generation` | `generations.get`, `generations.wait` |
+| `get_generation_download`, `generations.download(downloadType=)` | `generations.media`, `generations.download(file="audio")` |
+| `list_projects`, `list_project_generations` | `projects.list` / `projects.iter`, `generations.list` / `generations.iter` |
+| `restore_audio(filePath=)` returning `(bytes, info)` | `restore_audio(path, output_path=)` returning `RestoreResult`; failures raise |
+| `audio_isolation.isolate` | `restore_audio`, or `projects.create` + `projects.upload` + `generations.create` |
+| `usage.summary` | `usage.get(start=, end=)` |
+| `webhooks.configure`, `webhooks.send_test_event` | `webhooks.portal()` |
+| `account`, `api_keys` | no API route; use the developer dashboard |
+| `DiffioApiError.statusCode`, `.responseBody` | `.status`, `.code`, `.message`, `.request_id`, `.details`, `.body` |
 
-## Upgrading to 0.2.0
+Model names: `diffio-flash` and `diffio-pro` always mean the current model of each tier; `diffio-4.7-flash` and
+`diffio-4.7-pro` name the current models exactly. Retired names still run, on the current model of their tier
+(`generation.substituted` is true). `client.models.list()` lists them all.
 
-0.2.0 followed the Diffio 4.5 API. It had breaking changes:
-
-* Only `diffio-4.5-flash` and `diffio-4.5-pro` were accepted, and the default model was
-  `diffio-4.5-flash`. `diffio-2`, `diffio-2-flash`, `diffio-3.4`, `diffio-3.5`,
-  `diffio-4.0-flash`, and `diffio-4.0-pro` were removed with no aliases.
-* `CreateProjectResponse` no longer has `uploadUrl`, `uploadMethod`, or `bucket`. It has
-  `upload` (a `ProjectUploadSession`) and `uploadCompletion` (a `CompleteProjectUploadResponse`).
-  Uploads use the multipart upload API instead of a single signed PUT.
-* `GenerationDownloadResponse` no longer has `bucket`.
-* Error messages from the upload API (`{"error": {"code", "message"}}`) become the
-  `DiffioApiError` message; the full body stays in `responseBody`.
-
-Earlier SDK releases cannot upload to the current API: `create_project` fails with
-`KeyError: 'uploadUrl'`.
+`DIFFIO_API_BASE_URL` set to `https://api.diffio.ai/v1` (as the 0.x docs showed) is read as the host, and `/v2`
+is used.
 
 ## Tutorials
 
-* Audio restoration CLI tutorial: `tutorials/audio-restoration-cli/README.md`
-
-## Runtime compatibility
-
-Use Python 3.8 or later.
+* Audio restoration CLI: `tutorials/audio-restoration-cli/README.md`
 
 ## Tests
 
 ```bash
-cd diffio-python
 python -m pip install -r requirements-dev.txt
+python -m pip install -e .
 python -m pytest
 ```
+
+The tests run against an in-memory fake of the v2 API (`tests/fake_api.py`); they make no network calls.
